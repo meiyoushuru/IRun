@@ -13,6 +13,6 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="VRun-iOS17",
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="IRun-iOS17",
           console=True, strip=False, upx=False)
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="VRun-iOS17")
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="IRun-iOS17")

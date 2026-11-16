@@ -25,6 +25,11 @@ class Device:
     udid: str
     name: str
     version: str
+    product_type: str = ""
+
+    @property
+    def system_name(self) -> str:
+        return "iPadOS" if self.product_type.startswith("iPad") else "iOS"
 
 
 def friendly_error(text: str) -> str:
@@ -50,7 +55,7 @@ class DeviceBackend:
                 cancel: threading.Event | None = None) -> str:
         executable = self.tools / (tool + ".exe")
         if not executable.is_file():
-            raise DeviceError("设备工具缺失，请重新安装 VRun。")
+            raise DeviceError("设备工具缺失，请重新安装 IRun。")
         if cancel and cancel.is_set():
             raise Cancelled()
         try:
@@ -84,7 +89,10 @@ class DeviceBackend:
         output = self.command("ideviceinfo", "-s", "-x", timeout=5, cancel=cancel)
         try:
             data = plistlib.loads(output[output.index("<?xml"):].encode("utf-8"))
-            device = Device(data["UniqueDeviceID"], data.get("DeviceName", "iPhone"), data["ProductVersion"])
+            product_type = data.get("ProductType", "")
+            default_name = "iPad" if product_type.startswith("iPad") else "iPhone"
+            device = Device(data["UniqueDeviceID"], data.get("DeviceName", default_name),
+                            data["ProductVersion"], product_type)
             int(device.version.split(".")[0])  # Validate the version before selecting a backend.
         except (ValueError, KeyError, plistlib.InvalidFileException) as error:
             raise DeviceError("无法读取手机信息，请解锁手机并确认信任此电脑。") from error

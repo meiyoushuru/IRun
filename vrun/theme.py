@@ -104,32 +104,38 @@ QLabel#runState[active="true"] {{ color: {p['ink']}; }}
 QLabel#connection {{ color: {p['muted']}; font-weight: 600; }}
 QLabel#connection[connected="true"] {{ color: {p['success']}; }}
 QLabel#message {{ padding: 8px 12px; border: 1px solid {p['border']}; border-radius: 9px; background: {p['surface']}; color: {p['muted']}; }}
+QLabel#settingsFeedback {{ color: {p['ink']}; font-size: 11px; }}
+QDialog#routeManager QListWidget {{
+    background: {p['surface']}; alternate-background-color: {p['field']};
+    border: 1px solid {p['border']}; border-radius: 9px; padding: 5px;
+    selection-background-color: {p['accent']}; selection-color: {p['accent_text']}; outline: none;
+}}
+QDialog#routeManager QListWidget::item {{ padding: 7px; border-radius: 4px; }}
+QDialog#routeManager QListWidget::item:selected {{ background: {p['accent']}; color: {p['accent_text']}; }}
 QComboBox, QLineEdit {{
     background: {p['field']}; border: 1px solid {p['border']}; border-radius: 9px;
     padding: 7px 12px; min-height: 20px; selection-background-color: {p['accent']}; selection-color: {p['accent_text']};
 }}
 QComboBox {{ padding-right: 34px; }}
 QComboBox:hover, QLineEdit:hover {{ border-color: {p['muted']}; }}
-QComboBox:focus, QLineEdit:focus {{ border-color: {p['accent']}; }}
+QComboBox:focus, QComboBox[popupOpen="true"], QLineEdit:focus {{ border-color: {p['accent']}; }}
 QComboBox:disabled, QLineEdit:disabled {{ color: {p['disabled']}; background: {p['disabled_bg']}; }}
+QLineEdit:read-only {{ color: {p['muted']}; background: {p['surface']}; }}
 QComboBox::drop-down {{ border: none; background: transparent; width: 30px; }}
 QComboBox::down-arrow {{ image: url("{arrow}"); width: 12px; height: 12px; }}
 QComboBox QLineEdit {{ background: transparent; border: none; padding: 0; margin: 0; }}
-QComboBox QAbstractItemView {{
-    background: {p['surface']}; color: {p['text']}; border: 1px solid {p['border']};
-    padding: 5px; outline: none; selection-background-color: {p['accent']}; selection-color: {p['accent_text']};
-}}
-QComboBox QAbstractItemView::item {{ min-height: 29px; padding-left: 8px; }}
+QRadioButton {{ spacing: 6px; }}
 QCheckBox {{ spacing: 7px; }}
 QCheckBox:disabled {{ color: {p['disabled']}; }}
 QCheckBox::indicator {{ width: 15px; height: 15px; border: 1px solid {p['border']}; border-radius: 4px; background: {p['field']}; }}
 QCheckBox::indicator:checked {{ background: {p['accent']}; border-color: {p['accent']}; image: url("{check}"); }}
 QPushButton {{ background: {p['field']}; color: {p['text']}; border: 1px solid {p['border']}; border-radius: 9px; padding: 9px 18px; min-height: 20px; font-weight: 600; }}
-QPushButton#start {{ background: {p['accent']}; color: {p['accent_text']}; border: 1px solid {p['accent']}; }}
-QPushButton#start:hover {{ background: {p['hover']}; }}
+QPushButton#start, QPushButton#saveDrawnRoute {{ background: {p['accent']}; color: {p['accent_text']}; border: 1px solid {p['accent']}; }}
+QPushButton#start:hover, QPushButton#saveDrawnRoute:hover {{ background: {p['hover']}; }}
 QPushButton#stop {{ background: {p['surface']}; color: {p['text']}; border: 1px solid {p['border']}; }}
 QPushButton#stop:hover {{ background: {p['field']}; }}
-QPushButton#start:disabled, QPushButton#stop:disabled {{ background: {p['disabled_bg']}; color: {p['disabled']}; border: 1px solid {p['border']}; }}
+QPushButton#start:disabled, QPushButton#stop:disabled, QPushButton#pause:disabled,
+QDialog#drawRouteDialog QPushButton:disabled {{ background: {p['disabled_bg']}; color: {p['disabled']}; border: 1px solid {p['border']}; }}
 QProgressBar {{ background: {p['track']}; border: none; border-radius: 3px; height: 5px; }}
 QProgressBar::chunk {{ background: {p['ink']}; border-radius: 3px; }}
 QScrollBar:vertical {{ background: {p['background']}; width: 8px; border: none; }}

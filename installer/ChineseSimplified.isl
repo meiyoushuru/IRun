@@ -1,4 +1,4 @@
-﻿; Adapted for Inno Setup 6.4.3 by VRun: newer unsupported keys omitted.
+﻿; Adapted for Inno Setup 6.4.3 by IRun: newer unsupported keys omitted.
 ; Original source: https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl
 ; *** Inno Setup version 6.5.0+ Chinese Simplified messages ***
 ;

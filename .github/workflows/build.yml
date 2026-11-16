@@ -33,7 +33,7 @@ jobs:
           python scripts/build.py --installer
       - uses: actions/upload-artifact@v4
         with:
-          name: VRun-Windows-x64
+          name: IRun-Windows-x64
           path: |
             release/*
           if-no-files-found: error

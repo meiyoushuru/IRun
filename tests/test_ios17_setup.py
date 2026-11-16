@@ -2,9 +2,9 @@
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 import pytest
-from ios17_helper.main import Session
+from ios17_helper.main import Session, open_paired_usb
 
 
 @pytest.fixture
@@ -23,6 +23,7 @@ def api(monkeypatch):
         location=SimpleNamespace(set=AsyncMock(), clear=AsyncMock()),
         mounted=True, tunnel_args=[], events=[])
     factory = AsyncMock(side_effect=lambda **kwargs: state.lockdown)
+    state.create_lockdown = factory
     monkeypatch.setattr(lockdown, "create_using_usbmux", factory)
     @asynccontextmanager
     async def userspace(**kwargs):
@@ -47,7 +48,15 @@ def api(monkeypatch):
     state.mount = AsyncMock()
     state.reveal = AsyncMock()
     monkeypatch.setattr(tunnel, "UserspaceRsdTunnel", userspace)
-    monkeypatch.setattr(mounter, "PersonalizedImageMounter", mounted)
+    state.legacy_image_probe = AsyncMock()
+    @asynccontextmanager
+    async def image_probe(provider):
+        await state.legacy_image_probe()
+        async with mounted(provider) as image:
+            yield image
+    image_probe.IMAGE_TYPE = "Personalized"
+    monkeypatch.setattr(mounter, "PersonalizedImageMounter", image_probe)
+    monkeypatch.setattr(mounter, "uses_cryptex_image", lambda _: state.lockdown.product_version.startswith("27."))
     monkeypatch.setattr(mounter, "auto_mount", state.mount)
     monkeypatch.setattr(dvt, "DvtProvider", provider)
     monkeypatch.setattr(location, "LocationSimulation", simulation)
@@ -64,13 +73,46 @@ def test_userspace_setup_pins_device_and_reuses_mounted_image(api, version):
         await session.set(30, 120)
         await session.clear()
         await session.close()
-        assert api.tunnel_args == [{"serial": "phone", "autopair": True, "remotepairing_fallback": False}]
+        assert api.tunnel_args == [{"serial": "phone", "autopair": False, "remotepairing_fallback": False}]
         api.mount.assert_not_awaited()
         api.location.set.assert_awaited_once_with(30, 120)
         api.location.clear.assert_awaited_once()
         api.lockdown.close.assert_awaited_once()
         assert api.events == ["tunnel-open", "tunnel-close"]
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("paired", [True, False])
+def test_save_pair_record_conflict_only_reuses_a_valid_pairing(api, monkeypatch, paired):
+    from pymobiledevice3.exceptions import MuxException
+    error = MuxException("usbmuxd rejected the SavePairRecord request: {'MessageType': 'Result', 'Number': 183}")
+    api.lockdown.paired = paired
+    api.create_lockdown.side_effect = [error, api.lockdown, api.lockdown]
+    monkeypatch.setattr("ios17_helper.main.asyncio.sleep", AsyncMock())
+    session = Session("phone")
+    if paired:
+        async def scenario():
+            await session.open()
+            await session.close()
+        asyncio.run(scenario())
+        assert api.tunnel_args == [{"serial": "phone", "autopair": False, "remotepairing_fallback": False}]
+        api.lockdown.close.assert_awaited_once()
+    else:
+        with pytest.raises(RuntimeError, match="SavePairRecord 183"):
+            asyncio.run(session.open())
+        assert not api.tunnel_args
+        assert api.lockdown.close.await_count == 2
+    assert api.create_lockdown.await_args_list == [call(serial="phone")] + [
+        call(serial="phone", autopair=False)
+    ] * (1 if paired else 2)
+
+
+def test_different_usbmux_error_is_not_retried(api):
+    from pymobiledevice3.exceptions import MuxException
+    api.create_lockdown.side_effect = MuxException("usbmuxd rejected the Connect request: {'Number': 183}")
+    with pytest.raises(MuxException, match="Connect"):
+        asyncio.run(open_paired_usb("phone"))
+    api.create_lockdown.assert_awaited_once_with(serial="phone")
 
 
 def test_unmounted_image_is_prepared_in_tunnel(api):
@@ -81,6 +123,25 @@ def test_unmounted_image_is_prepared_in_tunnel(api):
         api.mount.assert_awaited_once_with(api.rsd)
         await session.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("already_mounted", [False, True])
+def test_ios_27_checks_cryptex_without_legacy_image_probe(api, already_mounted):
+    from pymobiledevice3.exceptions import AlreadyMountedError
+    api.lockdown.product_version = "27.3.1"
+    if already_mounted:
+        api.mount.side_effect = AlreadyMountedError("Cryptex is already installed")
+
+    async def scenario():
+        session = Session("phone")
+        await session.open()
+        await session.set(30, 120)
+        await session.close()
+
+    asyncio.run(scenario())
+    api.legacy_image_probe.assert_not_awaited()
+    api.mount.assert_awaited_once_with(api.rsd)
+    api.location.clear.assert_awaited_once()
 
 
 def test_developer_mode_failure_reveals_setting_without_changing_location(api):

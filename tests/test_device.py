@@ -18,6 +18,18 @@ def test_new_ios_is_discovered(monkeypatch):
     assert backend._modern is None
 
 
+def test_ipad_is_labeled_ipados_and_uses_modern_backend(monkeypatch):
+    backend = DeviceBackend()
+    data = {"UniqueDeviceID": "test-ipad", "ProductType": "iPad16,3",
+            "DeviceName": "平板", "ProductVersion": "27.0.1"}
+    monkeypatch.setattr(backend, "command", lambda *a, **kw: plistlib.dumps(data).decode())
+    device = backend.probe()
+    assert device.system_name == "iPadOS"
+    assert device.name == "平板"
+    assert device.version == "27.0.1"
+    assert backend.is_modern(device)
+
+
 def test_preparation_and_reset_keep_same_device(monkeypatch):
     backend = DeviceBackend()
     commands = []

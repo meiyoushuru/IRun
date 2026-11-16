@@ -18,9 +18,9 @@ LOG = logging.getLogger(__name__)
 
 def helper_command():
     if getattr(sys, "frozen", False):
-        executable = resource_dir() / "ios17" / "VRun-iOS17.exe"
+        executable = resource_dir() / "ios17" / "IRun-iOS17.exe"
         if not executable.is_file():
-            raise DeviceError("iOS 17+ 组件缺失，请重新安装 VRun。")
+            raise DeviceError("iOS 17+ 组件缺失，请重新安装 IRun。")
         return [str(executable)]
     return [sys.executable, str(Path(__file__).resolve().parents[1] / "ios17_helper" / "main.py")]
 
@@ -118,10 +118,16 @@ class ModernBackend:
 
     def reset(self, device):
         try:
+            started = time.monotonic()
             self.open(device)
+            LOG.info("Location reset transport ready after %.2f s", time.monotonic() - started)
+            started = time.monotonic()
             self.request("clear")
+            LOG.info("Stop simulation sent by helper after %.2f s", time.monotonic() - started)
         finally:
+            started = time.monotonic()
             self.close()
+            LOG.info("Location reset transport closed after %.2f s", time.monotonic() - started)
 
     def close(self):
         process, self.process = self.process, None

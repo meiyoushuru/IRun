@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,19 +43,18 @@ def copy_runtime_notices(target: Path):
 
 
 def copy_release_material(target: Path):
-    for directory in ("routes", "LICENSES"):
-        shutil.copytree(ROOT / directory, target / directory, dirs_exist_ok=True)
-    for name in ("LICENSE", "README.md", "UPSTREAM.md", "THIRD_PARTY_NOTICES.md"):
+    shutil.copytree(ROOT / "LICENSES", target / "LICENSES", dirs_exist_ok=True)
+    for name in ("LICENSE", "README.md", "CHANGELOG.md", "UPSTREAM.md", "THIRD_PARTY_NOTICES.md"):
         shutil.copy2(ROOT / name, target / name)
     copy_runtime_notices(target)
     source_dir = target / "SOURCE"
     source_dir.mkdir(exist_ok=True)
     entries = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
                                       cwd=ROOT).decode("utf-8").split("\0")
-    with zipfile.ZipFile(source_dir / f"VRun-{__version__}-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(source_dir / f"IRun-{__version__}-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
         for entry in sorted(set(entries)):
             path = ROOT / entry
-            if entry and path.is_file() and not entry.startswith(("libimobiledevice/", "DeveloperDiskImage/")):
+            if entry and path.is_file() and not entry.startswith(("routes/", "libimobiledevice/", "DeveloperDiskImage/")):
                 archive.write(path, entry)
     shutil.copytree(ROOT / "third_party" / "sources", source_dir / "third_party", dirs_exist_ok=True)
 
@@ -67,6 +67,31 @@ def find_iscc():
     return next((path for path in candidates if path and Path(path).is_file()), None)
 
 
+def verify_bundle(target: Path):
+    internal = target / "_internal"
+    manifest = json.loads((ROOT / "third_party/windows-manifest.json").read_text(encoding="utf-8"))
+    for entry in manifest["files"]:
+        tool = internal / "libimobiledevice" / "win" / entry["name"]
+        if hashlib.sha256(tool.read_bytes()).hexdigest() != entry["sha256"]:
+            raise RuntimeError(f"Unexpected content in bundled {tool.name}")
+        if tool.suffix == ".exe":
+            subprocess.run([str(tool), "--version"], check=True, timeout=15)
+
+    for source in (ROOT / "DeveloperDiskImage").glob("*/*"):
+        bundled = internal / "DeveloperDiskImage" / source.relative_to(ROOT / "DeveloperDiskImage")
+        if source.is_file() and (not bundled.is_file() or bundled.stat().st_size != source.stat().st_size):
+            raise RuntimeError(f"Missing or incomplete developer image: {bundled}")
+    subprocess.run([str(internal / "ios17/IRun-iOS17.exe"), "--check"], check=True, timeout=30)
+
+    with TemporaryDirectory(prefix="IRun-build-check-") as temporary:
+        screenshot = Path(temporary) / "startup.png"
+        env = os.environ | {"LOCALAPPDATA": temporary}
+        subprocess.run([str(target / "IRun.exe"), "--screenshot", str(screenshot)],
+                       env=env, check=True, timeout=30)
+        if not screenshot.is_file() or not screenshot.stat().st_size:
+            raise RuntimeError("The packaged IRun window did not render")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--installer", action="store_true")
@@ -75,15 +100,15 @@ def main():
     os.chdir(ROOT)
     if not args.prepare_only:
         subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "ios17_helper/helper.spec"], check=True)
-        subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "VRun.spec"], check=True)
-    target = ROOT / "dist/VRun"
-    if not (target / "VRun.exe").is_file():
-        raise SystemExit("dist/VRun/VRun.exe is missing")
-    helper = ROOT / "dist/VRun-iOS17"
-    if not (helper / "VRun-iOS17.exe").is_file():
-        raise SystemExit("dist/VRun-iOS17/VRun-iOS17.exe is missing")
-    subprocess.run([str(helper / "VRun-iOS17.exe"), "--check"], check=True)
+        subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "IRun.spec"], check=True)
+    target = ROOT / "dist/IRun"
+    if not (target / "IRun.exe").is_file():
+        raise SystemExit("dist/IRun/IRun.exe is missing")
+    helper = ROOT / "dist/IRun-iOS17"
+    if not (helper / "IRun-iOS17.exe").is_file():
+        raise SystemExit("dist/IRun-iOS17/IRun-iOS17.exe is missing")
     shutil.copytree(helper, target / "_internal/ios17", dirs_exist_ok=True)
+    verify_bundle(target)
     copy_release_material(target)
     release = ROOT / "release"
     release.mkdir(exist_ok=True)
@@ -98,13 +123,13 @@ def main():
         compiler = find_iscc()
         if not compiler:
             raise SystemExit("Inno Setup 6/7 is required; set INNO_ISCC to ISCC.exe")
-        subprocess.run([compiler, str(ROOT / "installer/VRun.iss")], check=True)
-    artifacts = list(release.glob("*.exe"))
+        subprocess.run([compiler, f"/DAppVersion={__version__}", str(ROOT / "installer/IRun.iss")], check=True)
+    artifacts = sorted(release.glob(f"IRun-{__version__}-*.exe"))
     (release / "SHA256SUMS.txt").write_text(
         "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in artifacts),
         encoding="utf-8",
     )
-    print(f"Application: {target / 'VRun.exe'}")
+    print(f"Application: {target / 'IRun.exe'}")
     print(f"Release: {release}")
 
 

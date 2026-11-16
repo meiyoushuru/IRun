@@ -12,7 +12,11 @@ def resource_dir() -> Path:
     return Path(getattr(sys, "_MEIPASS", app_dir()))
 
 
+def local_data_root() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share"))
+
+
 def data_dir() -> Path:
-    directory = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share")) / "VRun"
+    directory = local_data_root() / "IRun"
     directory.mkdir(parents=True, exist_ok=True)
     return directory

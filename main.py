@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MPL-2.0
-"""VRun Windows desktop entry point."""
+"""IRun Windows desktop entry point."""
 import sys
 
 

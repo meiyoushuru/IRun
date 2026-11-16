@@ -11,9 +11,10 @@ import ctypes
 import json
 import logging
 import math
+import re
 import sys
 
-LOG = logging.getLogger("VRun.iOS17")
+LOG = logging.getLogger("IRun.iOS17")
 
 
 def emit(**message):
@@ -32,13 +33,39 @@ def explain(error):
     if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
         return "iOS 17+ 准备或通信超时，请检查 USB、手机解锁状态和下载镜像所需的网络。"
     if isinstance(error, ImportError):
-        return "iOS 17+ 依赖缺失，请重新安装完整的 VRun 安装包。"
+        return "iOS 17+ 依赖缺失，请重新安装完整的 IRun 安装包。"
     return f"iOS 17+ 设备通信失败（{name}）：{str(error)[:350]}"
 
 
 def early_ios17(version):
     parts = tuple(int(value) for value in version.split(".")[:2])
     return parts < (17, 4)
+
+
+async def open_paired_usb(udid):
+    from pymobiledevice3.exceptions import MuxException
+    from pymobiledevice3.lockdown import create_using_usbmux
+
+    try:
+        return await create_using_usbmux(serial=udid)
+    except MuxException as error:
+        # In the pinned library the plist result code is only present in the message.
+        message = str(error)
+        if (sys.platform != "win32"
+                or not message.startswith("usbmuxd rejected the SavePairRecord request:")
+                or not re.search(r"['\"]Number['\"]:\s*183\b", message)):
+            raise
+        emit(event="status", message="正在重新验证 Windows 上已有的 USB 配对记录…")
+        for delay in (0.25, 0.75):
+            await asyncio.sleep(delay)
+            connection = await create_using_usbmux(serial=udid, autopair=False)
+            if connection.paired and connection.udid == udid:
+                return connection
+            await connection.close()
+        raise RuntimeError(
+            "Windows 上已有 USB 配对记录，但未能验证（SavePairRecord 183）。"
+            "请解锁设备、重新插拔 USB，并在出现提示时确认「信任此电脑」，再点击开始。"
+        ) from error
 
 
 class Session:
@@ -49,16 +76,17 @@ class Session:
         self.location_attempted = False
 
     async def open(self):
-        from pymobiledevice3.lockdown import create_using_usbmux
         from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
         from pymobiledevice3.services.amfi import AmfiService
         from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
         from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
-        from pymobiledevice3.services.mobile_image_mounter import auto_mount, PersonalizedImageMounter
+        from pymobiledevice3.services.mobile_image_mounter import (
+            auto_mount, PersonalizedImageMounter, uses_cryptex_image,
+        )
         from pymobiledevice3.exceptions import AlreadyMountedError
 
         emit(event="status", message="正在检查 iOS 17+ 设备与开发者模式…")
-        lockdown = await create_using_usbmux(serial=self.udid)
+        lockdown = await open_paired_usb(self.udid)
         self.stack.push_async_callback(lockdown.close)
         if lockdown.udid != self.udid:
             raise RuntimeError("设备标识不匹配，已取消连接。")
@@ -71,20 +99,25 @@ class Session:
             raise RuntimeError("Developer mode is not enabled")
         if early_ios17(version):
             if sys.platform == "win32" and not ctypes.windll.shell32.IsUserAnAdmin():
-                raise RuntimeError("iOS 17.0–17.3 需要管理员权限建立隧道。请停止任务并关闭 VRun，右键选择“以管理员身份运行”。")
+                raise RuntimeError("iOS 17.0–17.3 需要管理员权限建立隧道。请停止任务并关闭 IRun，右键选择“以管理员身份运行”。")
             rsd = await self._early_tunnel()
         else:
             emit(event="status", message="正在建立 iOS 17.4+ USB 开发者隧道…")
             rsd = await self.stack.enter_async_context(
-                UserspaceRsdTunnel(serial=self.udid, autopair=True, remotepairing_fallback=False))
+                UserspaceRsdTunnel(serial=self.udid, autopair=False, remotepairing_fallback=False))
         if rsd.udid != self.udid:
             raise RuntimeError("开发者隧道连接到了其他设备，已停止。")
         emit(event="status", message="正在检查开发者镜像；首次准备可能需要联网下载，请稍候…")
-        async with PersonalizedImageMounter(rsd) as mounter:
-            mounted = await mounter.is_image_mounted("Personalized")
-        if not mounted:
+        if uses_cryptex_image(rsd):
+            # The library checks the Cryptex registration before downloading or installing it.
             with suppress(AlreadyMountedError):
                 await auto_mount(rsd)
+        else:
+            async with PersonalizedImageMounter(rsd) as mounter:
+                mounted = await mounter.is_image_mounted(PersonalizedImageMounter.IMAGE_TYPE)
+            if not mounted:
+                with suppress(AlreadyMountedError):
+                    await auto_mount(rsd)
         provider = await self.stack.enter_async_context(DvtProvider(rsd))
         self.location = await self.stack.enter_async_context(LocationSimulation(provider))
 
@@ -162,15 +195,24 @@ async def serve(udid):
 
 
 def check_dependencies():
+    import ssl
+    from pathlib import Path
     from importlib.metadata import version
     from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
     from pymobiledevice3.remote.tunnel_service import get_core_device_tunnel_services, start_tunnel
     from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
     from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
     from pymobiledevice3.services.mobile_image_mounter import auto_mount
+    from pymobiledevice3.services.cryptexd import CryptexdService
     from pytun_pmd3 import TunTapDevice
+    import pytun_pmd3
     import qh3
     import win32security
+    ssl.create_default_context()
+    if sys.platform == "win32":
+        wintun = Path(pytun_pmd3.__file__).parent / "wintun" / "bin" / "amd64" / "wintun.dll"
+        if not wintun.is_file():
+            raise RuntimeError("安装包缺少 64 位 Wintun 组件。")
     emit(ok=True, version=version("pymobiledevice3"), protocol=1)
     return 0
 

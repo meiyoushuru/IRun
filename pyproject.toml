@@ -1,6 +1,6 @@
 [project]
-name = "vrun"
-version = "0.3.1"
+name = "irun"
+version = "1.0.0"
 description = "Windows desktop virtual running with legacy and iOS 17+ backends"
 requires-python = ">=3.14,<3.15"
 license = "MPL-2.0"
@@ -13,5 +13,4 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--basetemp=build/pytest"
 pythonpath = ["."]

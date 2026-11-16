@@ -1,6 +1,6 @@
 # Third-party notices
 
-VRun desktop code is MPL-2.0. The independent ios17_helper executable is GPL-3.0-or-later. Third-party components retain their original licenses.
+IRun desktop code is MPL-2.0. The independent ios17_helper executable is GPL-3.0-or-later. Third-party components retain their original licenses.
 
 | Component | Version / origin | License / source |
 | --- | --- | --- |
@@ -44,7 +44,7 @@ Qt sources and licensing:
 
 ## Installer components
 
-Apple components are proprietary software downloaded from official endpoints. Drivers are not modified or re-signed; the VRun uninstaller does not remove existing Apple components.
+Apple components are proprietary software downloaded from official endpoints. Drivers are not modified or re-signed; the IRun uninstaller does not remove existing Apple components.
 
 The Simplified Chinese installer translation is adapted from [Inno Setup](https://github.com/jrsoftware/issrc/blob/main/Files/Languages/ChineseSimplified.isl). Translator notices are retained in installer/ChineseSimplified.isl.
 

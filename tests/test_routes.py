@@ -1,21 +1,25 @@
 # SPDX-License-Identifier: MPL-2.0
-from pathlib import Path
 import math
 import pytest
 from vrun.routes import LapCounter, load_route, pace_text
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.mark.parametrize("filename", ["HNroute.txt", "ZJG-west.txt", "ZJG-east.txt"])
-def test_default_routes_close_and_have_valid_duration(filename):
-    route = load_route(ROOT / "routes" / filename)
+def test_routes_close_and_have_valid_duration(varied_route):
+    route = varied_route
     assert route.points[0] == route.points[-1]
     assert 50 < route.length_m < 10000
     samples = list(route.samples(3.3))
     assert samples[-1][0] == route.points[0]
     assert sum(delta for _, delta in samples) == pytest.approx(route.length_m / 3.3)
     assert all(0 < delta <= 0.25 for _, delta in samples)
+
+
+def test_legacy_txt_still_converts_and_closes(tmp_path):
+    path = tmp_path / "custom.txt"
+    path.write_text("[{'lat': 30, 'lng': 120}, {'lat': 30.001, 'lng': 120}]", encoding="utf-8")
+    route = load_route(path)
+    assert route.points[0] == route.points[-1]
+    assert route.points[0].lat != 30
+    assert 210 < route.length_m < 235
 
 
 @pytest.mark.parametrize("contents", [
