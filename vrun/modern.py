@@ -11,6 +11,7 @@ import threading
 import time
 
 from .device import Cancelled, DeviceError
+from .diagnostics import error_summary
 from .paths import data_dir, resource_dir
 
 LOG = logging.getLogger(__name__)
@@ -56,7 +57,9 @@ class ModernBackend:
             except queue.Empty:
                 continue
             if response is None:
-                raise DeviceError("iOS 17+ 连接已中断。请保持同一台手机连接后重试。")
+                code = self.process.poll() if self.process is not None else None
+                suffix = f"（组件退出码 {code}）" if code is not None else ""
+                raise DeviceError("iOS 17+ 连接已中断。请保持同一台手机连接后重试。" + suffix)
             if not isinstance(response, dict):
                 continue
             if response.get("event") == "status":
@@ -66,7 +69,15 @@ class ModernBackend:
             if response.get("id") != identifier:
                 continue
             if not response.get("ok"):
-                raise DeviceError(str(response.get("error", "iOS 17+ 通信失败。"))[:600])
+                message = str(response.get("error", "iOS 17+ 通信失败。"))
+                category = response.get("error_type")
+                codes = response.get("codes")
+                if isinstance(category, str) and category not in message:
+                    message += f"（{category}）"
+                detail = str(response.get("detail", ""))
+                if isinstance(codes, dict):
+                    detail += "\n" + " ".join(f"{key} {value}" for key, value in codes.items())
+                raise DeviceError(error_summary(message, detail, private_values=(self.udid,)))
             return response
 
     def open(self, device, cancel=None, status=lambda text: None):

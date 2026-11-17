@@ -38,5 +38,5 @@ def test_error_output_is_not_reported_as_success(monkeypatch):
     process.communicate.return_value = (b"ERROR: No device found!", b"")
     process.poll.return_value = 0
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: process)
-    with pytest.raises(DeviceError, match="iPhone"):
+    with pytest.raises(DeviceError, match="未找到设备"):
         DeviceBackend().command("ideviceinfo")

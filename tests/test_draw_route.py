@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: MPL-2.0
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
+from zipfile import ZipFile
 
-from PySide6.QtCore import (QBuffer, QEventLoop, QIODevice, QObject, QPoint, QPointF,
+import pytest
+
+from PySide6.QtCore import (QBuffer, QCoreApplication, QEvent, QEventLoop, QIODevice, QObject, QPoint, QPointF,
                             QSettings, Qt, QTimer, Signal)
 from PySide6.QtGui import QImage
 from PySide6.QtNetwork import QNetworkProxy
@@ -10,11 +14,13 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
 
 from vrun.app import Window
-from vrun.draw_dialog import DrawRouteDialog
+from vrun.draw_dialog import DrawRouteDialog, PRESET_SETTING
+from vrun.map_preview import MapRoutePreview
 from vrun.map_tiles import MapTiles
+from vrun.offline_maps import OFFLINE_MAP_ASSET, OfflineMaps
 from vrun.route_library import export_gpx, load_gpx
 from vrun.route_map import project, unproject
-from vrun.routes import Point
+from vrun.routes import Point, build_route
 
 
 class UnavailableTiles(QObject):
@@ -23,11 +29,13 @@ class UnavailableTiles(QObject):
 
     def __init__(self, cache_dir, parent):
         super().__init__(parent)
+        from types import SimpleNamespace
+        self.offline = SimpleNamespace(views=[])
+        self.offline_visible = set()
+        self.has_online_tiles = True
         self.images = {}
         self.pending = {}
         self.failed = set()
-        self.denied = set()
-        self.limited = set()
 
     def show_tiles(self, keys):
         self.failed = keys
@@ -58,15 +66,24 @@ def test_draw_drag_undo_close_save_and_export(application, monkeypatch, tmp_path
         try:
             assert isinstance(dialog, DrawRouteDialog)
             canvas = dialog.map
+            assert canvas.zoom_controls.pos() == QPoint(12, 12)
+            assert canvas.scale_bar.y() + canvas.scale_bar.height() + 12 == canvas.height()
             dialog.location.setText("31.221, 121.436")
             dialog.location.returnPressed.emit()
             assert (project(Point(31.221, 121.436)) - canvas.center).manhattanLength() < 1e-9
+            original_zoom, original_scale = canvas.zoom, canvas.scale_bar.label
+            canvas.zoom_in.click()
+            assert canvas.zoom == original_zoom + 1
+            assert canvas.scale_bar.label != original_scale
+            canvas.zoom_out.click()
+            assert canvas.zoom == original_zoom
+            assert canvas.scale_bar.label == original_scale
             anchor = QPointF(170, 120)
             start = (canvas.origin + anchor) / canvas.world_size
             canvas.zoom_by(1, anchor)
             assert ((canvas.origin + anchor) / canvas.world_size - start).manhattanLength() < 1e-9
             canvas.request_tiles()
-            assert "底图无法加载" in dialog.map_status.text()
+            assert "网络代理" in dialog.map_status.text()
 
             positions = [QPoint(120, 130), QPoint(220, 135), QPoint(210, 240)]
             for position in positions:
@@ -125,8 +142,133 @@ def test_map_projection_round_trip():
     assert abs(point.lng - 120.083) < 1e-10
 
 
-def test_map_tile_download_and_cache(application, tmp_path, monkeypatch):
-    monkeypatch.setattr("vrun.map_tiles._tianditu_key", lambda: "")
+@pytest.fixture
+def bundled_maps(application, tmp_path, monkeypatch):
+    views = [
+        {"name": f"测试地点 {label}", "lat": 0, "lng": lng, "zoom": 17,
+         "bounds": [lng - 0.005, -0.005, lng + 0.005, 0.005],
+         "focus_bounds": [lng - 0.005, -0.005, lng + 0.005, 0.005]}
+        for label, lng in (("A", 0), ("B", 0.05))
+    ]
+    image = QImage(256, 256, QImage.Format_RGB32)
+    image.fill(Qt.white)
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    assert image.save(buffer, "PNG")
+    pack = tmp_path / OFFLINE_MAP_ASSET
+    pack.parent.mkdir()
+    keys = set()
+    for view in views:
+        for zoom in range(13, 20):
+            world = 2 ** zoom
+            center = project(Point(view["lat"], view["lng"]))
+            x, y = int(center.x() * world), int(center.y() * world)
+            keys.update((zoom, x + dx, y + dy) for dx in range(-8, 9) for dy in range(-8, 9))
+    with ZipFile(pack, "w") as archive:
+        archive.writestr("views.json", json.dumps(views))
+        png = bytes(buffer.data())
+        for key in sorted(keys):
+            archive.writestr(OfflineMaps.tile_name(key), png)
+    monkeypatch.setattr("vrun.offline_maps.resource_dir", lambda: tmp_path)
+
+
+def test_bundled_presets_load_offline_without_tile_requests(application, tmp_path, bundled_maps):
+    tiles = MapTiles(tmp_path / "cache")
+    assert {view["name"] for view in tiles.offline.views} == {"测试地点 A", "测试地点 B"}
+    for view in tiles.offline.views:
+        west, south, east, north = view["focus_bounds"]
+        for zoom in range(13, 20):
+            for corner in (Point(north, west), Point(south, west), Point(north, east), Point(south, east)):
+                edge = project(corner)
+                corner_key = zoom, int(edge.x() * 2 ** zoom), int(edge.y() * 2 ** zoom)
+                assert tiles.offline.tile_name(corner_key) in tiles.offline.names
+        position = project(Point(view["lat"], view["lng"]))
+        zoom = view["zoom"]
+        size = 2 ** zoom
+        cx, cy = int(position.x() * size), int(position.y() * size)
+        keys = {(zoom, cx + x, cy + y) for x in (-1, 0, 1) for y in (-1, 0, 1)}
+        tiles.show_tiles(keys)
+        assert tiles.offline_visible == keys
+        assert tiles.images.keys() == keys
+        assert all(image.width() == 256 for image in tiles.images.values())
+        assert not tiles.has_online_tiles
+        assert not tiles.pending
+    tiles.deleteLater()
+    QCoreApplication.sendPostedEvents(tiles, QEvent.DeferredDelete)
+
+
+def test_main_map_preview_fits_route_and_uses_offline_tiles(application, tmp_path, bundled_maps):
+    from vrun import theme
+
+    preview = MapRoutePreview(tmp_path / "cache")
+    preview.colors = theme.colors("light")
+    preview.resize(380, 200)
+    points = (Point(0.001, 0.001), Point(0.002, 0.002))
+    preview.set_route(build_route(tmp_path / "demo.gpx", points, closed=False))
+    try:
+        preview._request_tiles()
+        assert preview.tiles.offline_visible
+        assert not preview.tiles.has_online_tiles
+        assert not preview.tiles.pending
+        world, _, origin = preview._view
+        for point in points:
+            pixel = project(point) * world - origin
+            assert 20 < pixel.x() < preview.width() - 20
+            assert 20 < pixel.y() < preview.height() - 20
+        assert not preview.grab().isNull()
+        preview.set_route(None)
+        assert not preview.tiles.images
+    finally:
+        preview.deleteLater()
+        QCoreApplication.sendPostedEvents(preview, QEvent.DeferredDelete)
+
+
+def test_closed_route_preserves_the_basemap_inside_the_outline(application, tmp_path):
+    from PySide6.QtGui import QColor, QPixmap
+    from vrun import theme
+
+    preview = MapRoutePreview(tmp_path / "cache")
+    preview.colors = theme.colors("light")
+    preview.resize(380, 200)
+    preview.set_route(build_route(tmp_path / "ring.gpx", (
+        Point(0.001, 0.001), Point(0.002, 0.001),
+        Point(0.002, 0.002), Point(0.001, 0.002),
+    ), closed=True))
+    green = QColor("#5ba949")
+    tile = QPixmap(256, 256)
+    tile.fill(green)
+    preview.tiles.images = {key: tile for key, _ in preview._visible_tiles()}
+    try:
+        for progress in (0, 0.75, 1):
+            preview.set_progress(progress, animate=False)
+            rendered = preview.grab().toImage()
+            assert rendered.pixelColor(preview.rect().center()) == green
+    finally:
+        preview.deleteLater()
+        QCoreApplication.sendPostedEvents(preview, QEvent.DeferredDelete)
+
+
+def test_missing_detailed_tile_uses_the_correct_quadrant_of_an_offline_parent(application, tmp_path):
+    from PySide6.QtGui import QColor, QPainter
+
+    pack = tmp_path / "offline.zip"
+    image = QImage(256, 256, QImage.Format_RGB32)
+    image.fill(Qt.white)
+    with QPainter(image) as painter:
+        painter.fillRect(128, 128, 128, 128, QColor("#5ba949"))
+    png = QBuffer()
+    png.open(QIODevice.WriteOnly)
+    assert image.save(png, "PNG")
+    with ZipFile(pack, "w") as archive:
+        archive.writestr("views.json", "[]")
+        archive.writestr("tiles/15/2/3.png", bytes(png.data()))
+    offline = OfflineMaps(pack)
+    images = offline.load({(16, 5, 7), (18, 23, 31)})
+    assert images.keys() == {(16, 5, 7)}
+    assert images[(16, 5, 7)].toImage().pixelColor(128, 128) == QColor("#5ba949")
+
+
+def test_map_tile_download_and_cache(application, tmp_path):
     image = QImage(256, 256, QImage.Format_RGB32)
     image.fill(Qt.white)
     buffer = QBuffer()
@@ -150,7 +292,7 @@ def test_map_tile_download_and_cache(application, tmp_path, monkeypatch):
         thread.start()
         try:
             tiles = MapTiles(tmp_path / "cache")
-            tiles.base_url = f"http://127.0.0.1:{server.server_port}"
+            tiles.osm_url = f"http://127.0.0.1:{server.server_port}"
             tiles.network.setProxy(QNetworkProxy(QNetworkProxy.NoProxy))
             loop = QEventLoop()
             tiles.changed.connect(lambda: loop.quit() if not tiles.pending else None)
@@ -174,46 +316,66 @@ def test_map_tile_download_and_cache(application, tmp_path, monkeypatch):
             thread.join()
 
 
-def test_tianditu_reads_local_key_and_requests_both_mercator_layers(application, tmp_path, monkeypatch):
-    from PySide6.QtCore import QUrlQuery
+def test_new_route_defaults_to_first_preset_and_restores_the_last(application, tmp_path, monkeypatch, bundled_maps):
+    from vrun import theme
 
-    monkeypatch.delenv("TIANDITU_KEY", raising=False)
-    monkeypatch.setattr("vrun.map_tiles.app_dir", lambda: tmp_path)
-    (tmp_path / ".env").write_text("TIANDITU_KEY=local-test-key\n", encoding="utf-8")
-    tiles = MapTiles(tmp_path / "cache")
-    assert tiles.layers == ("vec", "cva")
-    assert tiles.network.cache() is None
-    for layer in tiles.layers:
-        url = tiles.tile_url((16, 54628, 26973), layer)
-        query = QUrlQuery(url)
-        assert url.host() == "t0.tianditu.gov.cn"
-        assert url.path() == f"/{layer}_w/wmts"
-        assert query.queryItemValue("TILEMATRIXSET") == "w"
-        assert query.queryItemValue("TILECOL") == "54628"
-        assert query.queryItemValue("TILEROW") == "26973"
-        assert query.queryItemValue("tk") == "local-test-key"
+    monkeypatch.setattr(MapTiles, "show_tiles", lambda *_: None)
+    settings_path = str(tmp_path / "settings.ini")
+
+    def open_draw(width, height):
+        settings = QSettings(settings_path, QSettings.IniFormat)
+        dialog = DrawRouteDialog(tmp_path, None, theme.colors("light"), settings=settings)
+        dialog.resize(width, height)
+        dialog.show()
+        application.processEvents()
+        return dialog
+
+    def assert_preset_fits(dialog):
+        west, south, east, north = dialog.preset_choice.currentData()["focus_bounds"]
+        for point in (Point(north, west), Point(south, east)):
+            pixel = project(point) * dialog.map.world_size - dialog.map.origin
+            assert 0 <= pixel.x() <= dialog.map.width()
+            assert 0 <= pixel.y() <= dialog.map.height()
+
+    dialog = open_draw(850, 650)
+    assert dialog.preset_choice.currentText() == "测试地点 A"
+    assert_preset_fits(dialog)
+    second = dialog.preset_choice.findText("测试地点 B")
+    dialog.preset_choice.setCurrentIndex(second)
+    dialog.preset_choice.activated.emit(second)
+    assert dialog.settings.value(PRESET_SETTING) == "测试地点 B"
+    assert_preset_fits(dialog)
+    small_zoom = dialog.map.zoom
+    dialog.close()
+    dialog.deleteLater()
+    QCoreApplication.sendPostedEvents(dialog, QEvent.DeferredDelete)
+
+    reopened = open_draw(1400, 1300)
+    try:
+        assert reopened.preset_choice.currentText() == "测试地点 B"
+        assert_preset_fits(reopened)
+        assert reopened.map.zoom > small_zoom
+    finally:
+        reopened.close()
+        reopened.deleteLater()
+        QCoreApplication.sendPostedEvents(reopened, QEvent.DeferredDelete)
 
 
-def test_tianditu_composites_annotation_over_base_when_label_arrives_first(application, tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    from PySide6.QtGui import QColor
-    from PySide6.QtNetwork import QNetworkReply
 
-    monkeypatch.setattr("vrun.map_tiles._tianditu_key", lambda: "local-test-key")
-    tiles = MapTiles(tmp_path / "cache")
-    key = (16, 54628, 26973)
-    for layer in ("cva", "vec"):
-        image = QImage(256, 256, QImage.Format_ARGB32)
-        image.fill(Qt.transparent if layer == "cva" else Qt.white)
-        if layer == "cva":
-            image.setPixelColor(50, 50, QColor("red"))
-        buffer = QBuffer()
-        buffer.open(QIODevice.WriteOnly)
-        assert image.save(buffer, "PNG")
-        reply = SimpleNamespace(error=lambda: QNetworkReply.NetworkError.NoError,
-                                readAll=buffer.data, deleteLater=lambda: None)
-        tiles.pending[(key, layer)] = reply
-        tiles._finished((key, layer), reply)
-    rendered = tiles.images[key].toImage()
-    assert rendered.pixelColor(50, 50) == QColor("red")
-    assert rendered.pixelColor(51, 50) == QColor("white")
+def test_public_draw_dialog_has_no_preset_picker(application, tmp_path, monkeypatch):
+    from vrun import theme
+
+    monkeypatch.setattr(MapTiles, "show_tiles", lambda *_: None)
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    settings.setValue(PRESET_SETTING, "测试地点 A")
+    dialog = DrawRouteDialog(tmp_path, None, theme.colors("light"), settings=settings)
+    try:
+        dialog.show()
+        application.processEvents()
+        assert dialog.preset_choice is None
+        assert not dialog.tiles.offline.names
+        assert dialog.map.center == project(Point(0, 0))
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QCoreApplication.sendPostedEvents(dialog, QEvent.DeferredDelete)

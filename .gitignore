@@ -9,9 +9,11 @@ release/
 .env.*
 !.env.example
 .venv/
+.venv-irun/
 .vscode/
 .idea/
 .pymobiledevice3/
+/ios17_helper/ddi/
 *.pem
 *.key
 *.p12

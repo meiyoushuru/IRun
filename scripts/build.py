@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,7 +14,9 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from vrun import __version__
+from vrun import WINDOWS_FILE_VERSION, __version__
+from prepare_ddi import prepare as prepare_ddi
+from vrun.offline_maps import OFFLINE_MAP_ASSET
 
 
 def copy_runtime_notices(target: Path):
@@ -49,13 +52,10 @@ def copy_release_material(target: Path):
     copy_runtime_notices(target)
     source_dir = target / "SOURCE"
     source_dir.mkdir(exist_ok=True)
-    entries = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                                      cwd=ROOT).decode("utf-8").split("\0")
-    with zipfile.ZipFile(source_dir / f"IRun-{__version__}-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-        for entry in sorted(set(entries)):
-            path = ROOT / entry
-            if entry and path.is_file() and not entry.startswith(("routes/", "libimobiledevice/", "DeveloperDiskImage/")):
-                archive.write(path, entry)
+    archive = source_dir / f"IRun-{__version__}-source.zip"
+    subprocess.run(["git", "archive", "--format=zip", "--output", str(archive), "HEAD", "--", ".",
+                    ":(exclude)routes", ":(exclude)libimobiledevice", ":(exclude)DeveloperDiskImage"],
+                   cwd=ROOT, check=True)
     shutil.copytree(ROOT / "third_party" / "sources", source_dir / "third_party", dirs_exist_ok=True)
 
 
@@ -72,15 +72,18 @@ def verify_bundle(target: Path):
     manifest = json.loads((ROOT / "third_party/windows-manifest.json").read_text(encoding="utf-8"))
     for entry in manifest["files"]:
         tool = internal / "libimobiledevice" / "win" / entry["name"]
+        if tool.suffix == ".exe" and tool.name != "ideviceinfo.exe":
+            continue
         if hashlib.sha256(tool.read_bytes()).hexdigest() != entry["sha256"]:
             raise RuntimeError(f"Unexpected content in bundled {tool.name}")
         if tool.suffix == ".exe":
             subprocess.run([str(tool), "--version"], check=True, timeout=15)
 
-    for source in (ROOT / "DeveloperDiskImage").glob("*/*"):
-        bundled = internal / "DeveloperDiskImage" / source.relative_to(ROOT / "DeveloperDiskImage")
-        if source.is_file() and (not bundled.is_file() or bundled.stat().st_size != source.stat().st_size):
-            raise RuntimeError(f"Missing or incomplete developer image: {bundled}")
+    if (internal / "DeveloperDiskImage").exists():
+        raise RuntimeError("The application bundle contains obsolete iOS 15–16 images.")
+    pinned = (ROOT / "ios17_helper/ddi-lock.json").read_bytes()
+    if (internal / "ios17/_internal/ddi/bundle.json").read_bytes() != pinned:
+        raise RuntimeError("The packaged developer images do not match the pinned snapshot.")
     subprocess.run([str(internal / "ios17/IRun-iOS17.exe"), "--check"], check=True, timeout=30)
 
     with TemporaryDirectory(prefix="IRun-build-check-") as temporary:
@@ -92,39 +95,90 @@ def verify_bundle(target: Path):
             raise RuntimeError("The packaged IRun window did not render")
 
 
+def check_map_pack(path):
+    try:
+        with zipfile.ZipFile(path) as archive:
+            views = json.loads(archive.read("views.json"))
+            if not isinstance(views, list) or not views:
+                raise ValueError("missing preset views")
+            for view in views:
+                if (not isinstance(view, dict) or not isinstance(view.get("name"), str)
+                        or not view["name"].strip() or len(view.get("bounds", [])) != 4
+                        or len(view.get("focus_bounds", view["bounds"])) != 4):
+                    raise ValueError("invalid preset view")
+            if not any(re.fullmatch(r"tiles/\d+/\d+/\d+\.png", name) for name in archive.namelist()):
+                raise ValueError("missing tile images")
+            if corrupt := archive.testzip():
+                raise ValueError(f"corrupt ZIP entry: {corrupt}")
+    except (OSError, zipfile.BadZipFile, KeyError, TypeError, ValueError) as error:
+        raise SystemExit(f"Invalid offline map pack: {error}") from error
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--installer", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--offline-map-pack", type=Path)
+    parser.add_argument("--edition", help="Label for a custom build, used in its output paths")
     args = parser.parse_args()
+    if bool(args.offline_map_pack) != bool(args.edition):
+        parser.error("--offline-map-pack and --edition must be provided together")
+    pack = args.offline_map_pack.resolve() if args.offline_map_pack else None
+    if pack:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,29}", args.edition):
+            parser.error("--edition must contain only ASCII letters, numbers, and hyphens")
+        if pack.is_relative_to(ROOT):
+            parser.error("Keep the offline map pack outside the repository")
+        check_map_pack(pack)
     os.chdir(ROOT)
+    if subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT).returncode:
+        raise SystemExit("Commit tracked source changes before building a release.")
+    dist = ROOT / "dist"
+    work = ROOT / "build"
+    release = ROOT / "release"
+    suffix = ""
+    if pack:
+        dist = dist / "editions" / args.edition
+        work = work / "editions" / args.edition
+        release = release / "editions" / args.edition
+        suffix = f"-{args.edition}"
+    prepare_ddi(check_latest=args.installer)
     if not args.prepare_only:
-        subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "ios17_helper/helper.spec"], check=True)
-        subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "IRun.spec"], check=True)
-    target = ROOT / "dist/IRun"
+        for spec in ("ios17_helper/helper.spec", "IRun.spec"):
+            subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm",
+                            "--distpath", str(dist), "--workpath", str(work), spec], check=True)
+    target = dist / "IRun"
     if not (target / "IRun.exe").is_file():
-        raise SystemExit("dist/IRun/IRun.exe is missing")
-    helper = ROOT / "dist/IRun-iOS17"
+        raise SystemExit(f"{target / 'IRun.exe'} is missing")
+    helper = dist / "IRun-iOS17"
     if not (helper / "IRun-iOS17.exe").is_file():
-        raise SystemExit("dist/IRun-iOS17/IRun-iOS17.exe is missing")
+        raise SystemExit(f"{helper / 'IRun-iOS17.exe'} is missing")
+    offline_asset = target / "_internal" / OFFLINE_MAP_ASSET
+    if pack:
+        shutil.copy2(pack, offline_asset)
+    elif offline_asset.exists() or (offline_asset.parent / "maps").exists():
+        raise SystemExit("Unexpected map assets in the public bundle. Rebuild without --prepare-only.")
     shutil.copytree(helper, target / "_internal/ios17", dirs_exist_ok=True)
     verify_bundle(target)
     copy_release_material(target)
-    release = ROOT / "release"
-    release.mkdir(exist_ok=True)
+    release.mkdir(parents=True, exist_ok=True)
     manifest = {
         "version": __version__,
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip(),
         "python": sys.version,
         "platform": "Windows x64",
+        "edition": args.edition or "public",
     }
     (release / "build-info.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if args.installer:
         compiler = find_iscc()
         if not compiler:
             raise SystemExit("Inno Setup 6/7 is required; set INNO_ISCC to ISCC.exe")
-        subprocess.run([compiler, f"/DAppVersion={__version__}", str(ROOT / "installer/IRun.iss")], check=True)
-    artifacts = sorted(release.glob(f"IRun-{__version__}-*.exe"))
+        file_version = ".".join(map(str, WINDOWS_FILE_VERSION))
+        subprocess.run([compiler, f"/DAppVersion={__version__}", f"/DFileVersion={file_version}",
+                        f"/DBundleDir={target}", f"/DReleaseDir={release}", f"/DEditionSuffix={suffix}",
+                        str(ROOT / "installer/IRun.iss")], check=True)
+    artifacts = sorted(release.glob(f"IRun-{__version__}{suffix}-Setup-x64.exe"))
     (release / "SHA256SUMS.txt").write_text(
         "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in artifacts),
         encoding="utf-8",

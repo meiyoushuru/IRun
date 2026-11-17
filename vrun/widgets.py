@@ -329,6 +329,16 @@ class RoutePreview(QWidget):
                 painter.drawPoint(x, y)
         if not self.route:
             return
+        mapped = self._mapped_points(painter)
+        full = QPainterPath(mapped[0])
+        track_points = mapped[1:-1] if self.show_closing_segment else mapped[1:]
+        for point in track_points:
+            full.lineTo(point)
+        painter.setBrush(Qt.NoBrush)
+        self._paint_track(painter, full)
+        self._paint_progress(painter, mapped)
+
+    def _mapped_points(self, painter):
         points = self.route.points
         latitude = sum(point.lat for point in points) / len(points)
         longitude_scale = math.cos(math.radians(latitude))
@@ -341,14 +351,15 @@ class RoutePreview(QWidget):
         min_y, max_y = min(y for _, y in coords), max(y for _, y in coords)
         scale = max(1e-9, min((self.width()-50)/max(max_x-min_x, 1e-9),
                              (self.height()-40)/max(max_y-min_y, 1e-9)))
-        mapped = [QPointF(self.width()/2+(x-(min_x+max_x)/2)*scale,
-                         self.height()/2+(y-(min_y+max_y)/2)*scale) for x, y in coords]
-        full = QPainterPath(mapped[0])
-        track_points = mapped[1:-1] if self.show_closing_segment else mapped[1:]
-        for point in track_points:
-            full.lineTo(point)
-        painter.setPen(QPen(QColor(p["track"]), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        return [QPointF(self.width()/2+(x-(min_x+max_x)/2)*scale,
+                       self.height()/2+(y-(min_y+max_y)/2)*scale) for x, y in coords]
+
+    def _paint_track(self, painter, full):
+        painter.setPen(QPen(QColor(self.colors["track"]), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.drawPath(full)
+
+    def _paint_progress(self, painter, mapped):
+        p = self.colors
         if self.show_closing_segment:
             painter.setPen(QPen(QColor(p["ink"]), 2, Qt.DashLine))
             painter.drawLine(mapped[-2], mapped[0])
@@ -371,6 +382,7 @@ class RoutePreview(QWidget):
                 position = start + (end-start)*ratio
                 completed.lineTo(position)
                 break
+        painter.setBrush(Qt.NoBrush)
         painter.setPen(QPen(QColor(p["ink"]), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.drawPath(completed)
         painter.setPen(QPen(QColor(p["success"]), 2))

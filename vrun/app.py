@@ -2,6 +2,7 @@
 from pathlib import Path
 import argparse
 import ctypes
+from datetime import datetime
 import logging
 import math
 import os
@@ -16,14 +17,17 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame, QHB
 
 from . import __version__, theme
 from .device import Device, DeviceBackend
+from .diagnostics import export_report
 from .draw_dialog import DrawRouteDialog, choose_gpx_destination
 from .import_dialog import ImportRouteDialog
 from .manage_dialog import RouteManagerDialog
+from .map_preview import MapRoutePreview
+from .offline_maps import OSM_ATTRIBUTION
 from .paths import app_dir, data_dir, local_data_root, resource_dir
 from .route_library import (MAX_ROUTE_NAME_LENGTH, load_gpx, load_saved_route, read_saved_route,
                             rename_route, route_name_key, save_route, unique_route_name)
 from .routes import load_route, pace_text
-from .widgets import ChoiceBox, DistanceInput, PaceInput, RoutePreview, SpeedInput
+from .widgets import ChoiceBox, DistanceInput, PaceInput, SpeedInput
 from .worker import ProbeWorker, RunWorker, RestoreWorker
 
 LOG = logging.getLogger(__name__)
@@ -69,7 +73,9 @@ class Window(QMainWindow):
         self._paused_at = None
         self._last_restore_failed = False
         self._last_run_error = self._pending_restore = None
+        self._last_diagnostic_error = None
         self._last_restore_device = None
+        self._last_seen_device = None
         self._pending_start = self._applying_theme = False
         self.palette_colors = {}
         self.setWindowTitle(f"IRun · 虚拟跑步  {__version__}")
@@ -154,7 +160,7 @@ class Window(QMainWindow):
         row = QHBoxLayout()
         details = QVBoxLayout()
         details.setSpacing(2)
-        self.device_name = label("连接 iPhone 或 iPad", "section")
+        self.device_name = label("连接 iPhone", "section")
         self.device_hint = label("通过 USB 连接并解锁手机，确认“信任此电脑”。", "muted")
         self.device_hint.setWordWrap(True)
         details.addWidget(self.device_name)
@@ -204,7 +210,7 @@ class Window(QMainWindow):
         self.export_button.clicked.connect(self._export_route)
         route_actions.addWidget(self.export_button)
         route_layout.addLayout(route_actions)
-        self.preview = RoutePreview()
+        self.preview = MapRoutePreview(local_data_root() / "IRun" / "map-cache")
         route_layout.addWidget(self.preview, 1)
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("lapProgress")
@@ -215,7 +221,18 @@ class Window(QMainWindow):
         route_layout.addWidget(self.progress_bar)
         self.route_info = label("", "muted")
         self.route_info.setWordWrap(True)
-        route_layout.addWidget(self.route_info)
+        self.map_attribution = QLabel()
+        self.map_attribution.setObjectName("muted")
+        self.map_attribution.setOpenExternalLinks(True)
+        url, attribution = OSM_ATTRIBUTION
+        self.map_attribution.setText(f'<a href="{url}">© OpenStreetMap</a>')
+        self.map_attribution.setToolTip(attribution)
+        self.map_attribution.hide()
+        map_footer = QHBoxLayout()
+        map_footer.addWidget(self.route_info, 1)
+        map_footer.addWidget(self.map_attribution)
+        route_layout.addLayout(map_footer)
+        self.preview.tiles.changed.connect(self._update_preview_map_status)
         middle.addWidget(self.route_card, 1)
 
         options_card, options = card()
@@ -262,7 +279,13 @@ class Window(QMainWindow):
 
         self.message = label("选择路线与速度，点击开始。运行期间请保持 USB 连接。", "message")
         self.message.setWordWrap(True)
-        page.addWidget(self.message)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.message, 1)
+        self.export_diagnostics = QPushButton("导出诊断日志…")
+        self.export_diagnostics.setToolTip("保存当前报错和近期连接日志，便于反馈问题")
+        self.export_diagnostics.clicked.connect(self._export_diagnostic_report)
+        status_row.addWidget(self.export_diagnostics, 0, Qt.AlignVCenter)
+        page.addLayout(status_row)
         footer = QHBoxLayout()
         footer.addWidget(label("停止后会发送恢复正常定位命令。", "muted"), 1)
         self.stop_button = QPushButton("停止并恢复定位")
@@ -322,18 +345,28 @@ class Window(QMainWindow):
             self._applying_theme = False
 
     def _connected(self, device):
+        self._last_seen_device = device
         self.device_name.setText(device.name)
-        self.device_hint.setText(f"{device.system_name} {device.version}  ·  请保持 USB 连接")
+        hint = device.support_issue or "请保持 USB 连接"
+        version = f"{device.system_name} {device.version or '版本未知'}"
+        if device.system_name == "iPadOS":
+            hint = "IRun 已连接。部分跑步应用可能不支持 iPad。" + (
+                " " + device.support_issue if device.support_issue else "")
+        self.device_hint.setText(f"{version}  ·  {hint}")
         self.connection.setText("已连接")
         self.connection.setProperty("connected", True)
         self._refresh_style(self.connection)
+        self._update_start_button()
 
     def _disconnected(self, reason):
+        if reason != self.device_hint.text():
+            LOG.info("Device discovery: %s", reason)
         self.connection.setText("未连接")
         self.connection.setProperty("connected", False)
         self._refresh_style(self.connection)
-        self.device_name.setText("连接 iPhone 或 iPad")
+        self.device_name.setText("连接 iPhone")
         self.device_hint.setText(reason)
+        self._update_start_button()
 
     @staticmethod
     def _refresh_style(widget):
@@ -526,6 +559,7 @@ class Window(QMainWindow):
             QMessageBox.warning(parent, "无法打开路线编辑器", str(error))
             return
         dialog = DrawRouteDialog(directory, center, self.palette_colors, parent,
+                                 settings=self.settings,
                                  route=self.route if edit else None,
                                  name=self.routes.currentText() if edit else None, existing=existing,
                                  reserved_names=self._reserved_route_names)
@@ -620,8 +654,16 @@ class Window(QMainWindow):
         self.lap_title.setText("完成圈数" if closed else "完成往返")
         self.lap_unit.setText("圈" if closed else "次")
         self._on_progress(0)
-        self.start_button.setEnabled(self.route is not None and self.worker is None and self._pending_restore is None)
+        self._update_start_button()
         self.export_button.setEnabled(self.route is not None and self.worker is None)
+
+    def _update_preview_map_status(self):
+        tiles = self.preview.tiles
+        self.map_attribution.setVisible(bool(tiles.images))
+        self.preview.setToolTip(
+            "OpenStreetMap 底图加载失败。请检查是否使用了能访问该服务的网络代理。"
+            if tiles.failed else ""
+        )
 
     def _clear_stats(self):
         self.laps.setText("0")
@@ -744,6 +786,9 @@ class Window(QMainWindow):
     def start(self):
         if self.worker is not None or self.route is None or self._closing or self._pending_restore is not None:
             return
+        if issue := self._connected_support_issue():
+            self.message.setText(issue)
+            return
         try:
             target = self._target_m()
         except ValueError as error:
@@ -781,8 +826,19 @@ class Window(QMainWindow):
         self.message.setText("正在准备设备，请保持手机解锁…")
         worker.start()
 
+    def _connected_support_issue(self):
+        if self.connection.property("connected") and self._last_seen_device is not None:
+            return self._last_seen_device.support_issue
+        return ""
+
+    def _update_start_button(self, running=False):
+        self.start_button.setEnabled(
+            not running and self.worker is None and not self._pending_start and not self._closing
+            and self.route is not None and self._pending_restore is None and not self._connected_support_issue()
+        )
+
     def _set_controls(self, running):
-        self.start_button.setEnabled(not running and self.route is not None and self._pending_restore is None)
+        self._update_start_button(running)
         can_retry = self._pending_restore is not None or self._last_restore_device is not None
         self.stop_button.setEnabled(running or can_retry)
         self.stop_button.setText("停止并恢复定位" if running or not can_retry else "再次恢复定位")
@@ -812,8 +868,23 @@ class Window(QMainWindow):
             worker.start()
 
     def _failed(self, text):
-        self._last_run_error = text
+        self._last_run_error = self._last_diagnostic_error = text
         self.message.setText(text)
+
+    def _export_diagnostic_report(self):
+        default = f"IRun-{__version__}-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        filename, _ = QFileDialog.getSaveFileName(self, "导出 IRun 诊断日志", default, "文本文件 (*.txt)")
+        if not filename:
+            return
+        try:
+            export_report(Path(filename), data_dir(),
+                          status=f"{self.run_state.text()} · {self.connection.text()}\n"
+                                 f"{self.device_hint.text()}\n{self.message.text()}",
+                          device=self._last_seen_device, last_error=self._last_diagnostic_error)
+        except OSError as error:
+            QMessageBox.warning(self, "无法导出诊断日志", str(error))
+        else:
+            QMessageBox.information(self, "诊断日志已导出", "请查看保存的文本文件，确认后可发给维护者排查。")
 
     def _lap(self, laps, _):
         self.laps.setText(str(laps))
@@ -822,11 +893,12 @@ class Window(QMainWindow):
         self.distance.setText(f"{distance / 1000:.2f}")
 
     def _notify(self, distance):
-        self.message.setText(f"已达到目标！已运动距离（估算）{distance / 1000:.2f} 公里，将继续运行。")
+        ending = "运动将继续，请手动停止。"
+        self.message.setText(f"已达到目标！已运动距离（估算）{distance / 1000:.2f} 公里。{ending}")
         try:
             from winotify import Notification
             Notification(app_id="IRun.Desktop", title="IRun · 目标已完成",
-                         msg=f"已运动距离（估算）{distance / 1000:.2f} 公里。运动将继续，请手动停止。",
+                         msg=f"已运动距离（估算）{distance / 1000:.2f} 公里。{ending}",
                          icon=str(resource_dir() / "assets" / "irun.png")).show()
         except Exception:
             LOG.exception("Windows notification failed")
@@ -834,6 +906,8 @@ class Window(QMainWindow):
 
     def _restored(self, success, message):
         self._last_restore_failed = not success
+        if not success:
+            self._last_diagnostic_error = "\n".join(filter(None, (self._last_run_error, message)))
         self._pending_restore = None if success else getattr(self.worker, "device", None)
         # Do not overwrite the original preparation error with a generic "stopped" message.
         if message != "已停止。":
@@ -925,7 +999,7 @@ def run():
         window = Window(settings=settings, poll=False)
         if args.running_preview and window.route is not None:
             window._set_controls(True)
-            window._ready(Device("preview", "iPhone X · 运行界面预览", "16.7.16"))
+            window._ready(Device("preview", "iPhone · 运行界面预览", "17.6"))
             window._run_started = time.monotonic() - 462
             window._tick()
             window._lap(3, window.route.length_m * 3)

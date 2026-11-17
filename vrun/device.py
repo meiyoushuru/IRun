@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 """Bounded native-tool calls. Every operation after discovery targets the same UDID."""
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import plistlib
 import re
@@ -8,9 +9,13 @@ import subprocess
 import threading
 import time
 
+from .diagnostics import error_summary
+from .drivers import apple_usb_status
 from .paths import resource_dir
 from .routes import Point
 
+LOG = logging.getLogger(__name__)
+NO_DEVICE = "未找到设备。请检查 USB 连接并解锁设备。"
 
 class DeviceError(RuntimeError):
     pass
@@ -31,18 +36,31 @@ class Device:
     def system_name(self) -> str:
         return "iPadOS" if self.product_type.startswith("iPad") else "iOS"
 
+    @property
+    def support_issue(self) -> str:
+        version = re.match(r"^[0-9]+", self.version)
+        if not version:
+            return "无法确认苹果设备的系统版本，请重新连接设备。"
+        elif int(version[0]) < 17:
+            return "此系统版本不受支持。IRun 需要 iOS 或 iPadOS 17 及以上。"
+        return ""
+
+    def require_supported(self):
+        if issue := self.support_issue:
+            raise DeviceError(issue)
+
 
 def friendly_error(text: str) -> str:
     lower = text.lower()
-    if "no device" in lower or "not found" in lower or "no idevice" in lower:
-        return "未找到 iPhone。请检查 USB 连接、解锁手机，并确认 Apple 驱动已安装。"
+    if "no device" in lower or "no idevice" in lower:
+        return NO_DEVICE
     if "passcode" in lower or "password" in lower or "locked" in lower:
         return "请先解锁 iPhone，再点击开始。"
     if "trust" in lower or "pairingdialog" in lower or "userdenied" in lower:
         return "请在 iPhone 上选择“信任此电脑”，完成后再次点击开始。"
     if "developer" in lower:
         return "请检查手机的开发者模式和开发者镜像，然后重试。"
-    return "设备通信失败：" + text.strip()[:400]
+    return "设备通信失败。"
 
 
 class DeviceBackend:
@@ -50,6 +68,7 @@ class DeviceBackend:
         self.root = root or resource_dir()
         self.tools = self.root / "libimobiledevice" / "win"
         self._modern = None
+        self._next_usb_check = 0.0
 
     def command(self, tool: str, *args: str, timeout: float = 12,
                 cancel: threading.Event | None = None) -> str:
@@ -62,7 +81,7 @@ class DeviceBackend:
             process = subprocess.Popen([str(executable), *map(str, args)], stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as error:
-            raise DeviceError("无法启动设备工具，请检查安装文件或安全软件的拦截记录。") from error
+            raise DeviceError(error_summary("无法启动设备工具，请检查 IRun 安装。", str(error))) from error
         deadline = time.monotonic() + timeout
         try:
             while True:
@@ -81,71 +100,49 @@ class DeviceBackend:
                 process.communicate()
         output = stdout.decode("utf-8", errors="replace")
         errors = stderr.decode("utf-8", errors="replace")
-        if process.returncode or re.search(r"(?im)^error:", output):
-            raise DeviceError(friendly_error((output + "\n" + errors).strip()))
+        detail = (output + "\n" + errors).strip()
+        if process.returncode or re.search(r"(?im)^\s*error:", detail):
+            hint = friendly_error(detail)
+            if hint == NO_DEVICE:
+                raise DeviceError(hint)
+            LOG.warning("%s failed (exit %s). stdout=%r stderr=%r", tool, process.returncode,
+                        output[:4096], errors[:4096])
+            if process.returncode:
+                hint += f"（{tool} 退出码 {process.returncode}）"
+            raise DeviceError(error_summary(hint, detail))
         return output
 
     def probe(self, cancel: threading.Event | None = None) -> Device:
-        output = self.command("ideviceinfo", "-s", "-x", timeout=5, cancel=cancel)
+        try:
+            output = self.command("ideviceinfo", "-s", "-x", timeout=5, cancel=cancel)
+        except DeviceError:
+            if time.monotonic() >= self._next_usb_check:
+                self._next_usb_check = time.monotonic() + 60
+                LOG.info("Apple USB check after discovery failure:\n%s", apple_usb_status())
+            raise
         try:
             data = plistlib.loads(output[output.index("<?xml"):].encode("utf-8"))
             product_type = data.get("ProductType", "")
             default_name = "iPad" if product_type.startswith("iPad") else "iPhone"
             device = Device(data["UniqueDeviceID"], data.get("DeviceName", default_name),
                             data["ProductVersion"], product_type)
-            int(device.version.split(".")[0])  # Validate the version before selecting a backend.
         except (ValueError, KeyError, plistlib.InvalidFileException) as error:
             raise DeviceError("无法读取手机信息，请解锁手机并确认信任此电脑。") from error
         return device
 
-    def _mounted(self, device: Device, cancel: threading.Event) -> bool:
-        output = self.command("ideviceimagemounter", "-u", device.udid, "-l", "-x", cancel=cancel)
-        try:
-            data = plistlib.loads(output[output.index("<?xml"):].encode("utf-8"))
-        except (ValueError, plistlib.InvalidFileException) as error:
-            raise DeviceError("无法读取开发者镜像状态。") from error
-        return bool(data.get("ImageSignature"))
-
     def prepare(self, cancel: threading.Event, status) -> Device:
         status("正在检查手机，请保持 iPhone 解锁…")
         device = self.probe(cancel)
-        if self.is_modern(device):
-            return self._modern_backend().prepare(device, cancel, status)
-        self.command("idevicepair", "-u", device.udid, "pair", cancel=cancel)
-        if int(device.version.split(".")[0]) >= 16:
-            output = self.command("idevicedevmodectl", "-u", device.udid, "list", cancel=cancel)
-            if not re.search(r"\benabled\b", output, re.IGNORECASE):
-                self.command("idevicedevmodectl", "-u", device.udid, "reveal", cancel=cancel)
-                raise DeviceError("请在 iPhone 的“设置 → 隐私与安全性 → 开发者模式”中开启开发者模式，重启并确认后再点击开始。")
-        if not self._mounted(device, cancel):
-            versions = [device.version, ".".join(device.version.split(".")[:2])]
-            directory = next((self.root / "DeveloperDiskImage" / version for version in versions
-                              if (self.root / "DeveloperDiskImage" / version / "DeveloperDiskImage.dmg").is_file()
-                              and (self.root / "DeveloperDiskImage" / version / "DeveloperDiskImage.dmg.signature").is_file()), None)
-            if directory is None:
-                raise DeviceError(f"没有适配 iOS {device.version} 的开发者镜像，请在 DeveloperDiskImage 中添加对应版本。")
-            status("正在准备开发者镜像，请勿拔出 USB…")
-            self.command("ideviceimagemounter", "-u", device.udid,
-                         str(directory / "DeveloperDiskImage.dmg"),
-                         str(directory / "DeveloperDiskImage.dmg.signature"), timeout=90, cancel=cancel)
-            if not self._mounted(device, cancel):
-                raise DeviceError("开发者镜像挂载失败，请检查手机状态后重试。")
-        return device
+        device.require_supported()
+        return self._modern_backend().prepare(device, cancel, status)
 
     def set_location(self, device: Device, point: Point, cancel: threading.Event):
-        if self.is_modern(device):
-            return self._modern_backend().set_location(device, point, cancel)
-        self.command("idevicesetlocation", "-u", device.udid, "--", f"{point.lat:.8f}",
-                     f"{point.lng:.8f}", timeout=8, cancel=cancel)
+        device.require_supported()
+        return self._modern_backend().set_location(device, point, cancel)
 
     def reset(self, device: Device):
-        if self.is_modern(device):
-            return self._modern_backend().reset(device)
-        self.command("idevicesetlocation", "-u", device.udid, "reset", timeout=10)
-
-    @staticmethod
-    def is_modern(device: Device) -> bool:
-        return int(device.version.split(".")[0]) >= 17
+        device.require_supported()
+        return self._modern_backend().reset(device)
 
     def _modern_backend(self):
         if self._modern is None:

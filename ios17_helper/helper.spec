@@ -5,6 +5,7 @@ root = Path(SPECPATH).parent
 a = Analysis(
     [str(root / "ios17_helper" / "main.py")], pathex=[str(root)],
     datas=collect_data_files("pytun_pmd3") + collect_data_files("developer_disk_image")
+          + [(str(root / "ios17_helper" / "ddi"), "ddi")]
           + copy_metadata("pymobiledevice3", recursive=True),
     hiddenimports=["win32timezone", "win32security"],
     excludes=["tkinter", "PySide6", "PyQt5", "PyQt6", "numpy", "pandas",

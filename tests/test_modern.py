@@ -19,6 +19,16 @@ from tests.test_device import probe_output
 DEVICE = Device("same-device", "Test iPhone", "17.6")
 
 
+def test_helper_failure_summary_preserves_coded_error():
+    backend = ModernBackend()
+    backend.responses.put({"id": 0, "ok": False, "error": "请先解锁 iPhone。",
+                           "error_type": "OSError", "detail": "locked",
+                           "codes": {"winerror": 1167}})
+    with pytest.raises(DeviceError, match=r"(?i)winerror 1167") as error:
+        backend._receive(0, 1)
+    assert "OSError" in str(error.value)
+
+
 @pytest.mark.parametrize("version", ["17.0", "17.3.1", "17.4", "18.7", "26.0"])
 def test_modern_dispatch_never_uses_legacy_mount_or_location(monkeypatch, version):
     backend = DeviceBackend()
@@ -48,13 +58,15 @@ def test_modern_dispatch_never_uses_legacy_mount_or_location(monkeypatch, versio
                           ("clear", "test-device"), ("close",)]
 
 
-def test_legacy_does_not_load_modern_adapter(monkeypatch):
+def test_unsupported_device_cannot_set_or_reset_location(monkeypatch):
     backend = DeviceBackend()
     monkeypatch.setattr(backend, "_modern_backend", lambda: pytest.fail("legacy loaded modern helper"))
     monkeypatch.setattr(backend, "command", lambda *a, **kw: "")
     device = Device("legacy", "iPhone X", "16.7.16")
-    backend.set_location(device, Point(30, 120), threading.Event())
-    backend.reset(device)
+    with pytest.raises(DeviceError, match="需要 iOS 或 iPadOS 17"):
+        backend.set_location(device, Point(30, 120), threading.Event())
+    with pytest.raises(DeviceError, match="需要 iOS 或 iPadOS 17"):
+        backend.reset(device)
     backend.close()
 
 

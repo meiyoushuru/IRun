@@ -4,13 +4,14 @@ import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QMenu, QToolButton, QVBoxLayout, QWidget
 
 from .routes import MAX_ROUTE_POINTS, Point
 
 
 TILE_SIZE = 256
 MAX_LATITUDE = 85.0511287798066
+EARTH_RADIUS_M = 6378137
 
 
 def project(point: Point) -> QPointF:
@@ -23,6 +24,53 @@ def unproject(position: QPointF) -> Point:
     x = position.x() % 1
     y = max(0, min(1, position.y()))
     return Point(math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y)))), x * 360 - 180)
+
+
+def visible_tiles(origin, width, height, zoom, world_size):
+    count = 2 ** zoom
+    tile_size = world_size / count
+    left = math.floor(origin.x() / tile_size)
+    right = math.ceil((origin.x() + width) / tile_size)
+    top = max(0, math.floor(origin.y() / tile_size))
+    bottom = min(count, math.ceil((origin.y() + height) / tile_size))
+    for x in range(left, right):
+        for y in range(top, bottom):
+            yield (zoom, x % count, y), QRectF(x * tile_size - origin.x(),
+                y * tile_size - origin.y(), tile_size, tile_size)
+
+
+class MapScale(QWidget):
+    def __init__(self, colors, parent):
+        super().__init__(parent)
+        self.colors = colors
+        self.pixels = 0.0
+        self.label = ""
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFixedSize(124, 42)
+
+    def set_resolution(self, meters_per_pixel):
+        maximum = meters_per_pixel * 100
+        magnitude = 10 ** math.floor(math.log10(maximum))
+        distance = next(value * magnitude for value in (5, 2, 1) if value * magnitude <= maximum)
+        self.pixels = distance / meters_per_pixel
+        self.label = f"{distance / 1000:g} 公里" if distance >= 1000 else f"{distance:g} 米"
+        self.setAccessibleName(f"地图比例尺 {self.label}")
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QColor(self.colors["border"]))
+        painter.setBrush(QColor(self.colors["surface"]))
+        painter.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 6, 6)
+        painter.setPen(QColor(self.colors["text"]))
+        painter.drawText(QRectF(10, 4, self.width() - 18, 22), Qt.AlignLeft | Qt.AlignVCenter, self.label)
+        painter.setPen(QPen(QColor(self.colors["text"]), 1.5))
+        start = QPointF(11, 32)
+        end = start + QPointF(self.pixels, 0)
+        painter.drawLine(start, end)
+        for mark in (start, end):
+            painter.drawLine(mark - QPointF(0, 4), mark + QPointF(0, 2))
 
 
 class RouteMap(QWidget):
@@ -48,6 +96,40 @@ class RouteMap(QWidget):
         self.tile_timer.setInterval(150)
         self.tile_timer.timeout.connect(self.request_tiles)
         self.tiles.changed.connect(self.update)
+        self.zoom_controls = QFrame(self)
+        self.zoom_controls.setObjectName("mapZoomControls")
+        self.zoom_controls.setStyleSheet(f"""
+            QFrame#mapZoomControls {{ background: {colors['surface']}; border: 1px solid {colors['border']}; border-radius: 6px; }}
+            QToolButton {{ background: transparent; color: {colors['text']}; border: none; font-size: 18px; font-weight: 600; }}
+            QToolButton:hover {{ background: {colors['field']}; }}
+            QToolButton:disabled {{ color: {colors['muted']}; }}
+        """)
+        zoom_layout = QVBoxLayout(self.zoom_controls)
+        zoom_layout.setContentsMargins(1, 1, 1, 1)
+        zoom_layout.setSpacing(0)
+        self.zoom_in = self._zoom_button(zoom_layout, "+", "放大地图", 1)
+        self.zoom_out = self._zoom_button(zoom_layout, "−", "缩小地图", -1)
+        self.zoom_controls.adjustSize()
+        self.zoom_controls.move(12, 12)
+        self.scale_bar = MapScale(colors, self)
+        self._refresh_controls()
+
+    def _zoom_button(self, layout, text, label, step):
+        button = QToolButton(self.zoom_controls)
+        button.setText(text)
+        button.setAccessibleName(label)
+        button.setToolTip(label)
+        button.setFixedSize(32, 30)
+        button.clicked.connect(lambda: self.zoom_by(step))
+        layout.addWidget(button)
+        return button
+
+    def _refresh_controls(self):
+        self.zoom_in.setEnabled(self.zoom < 19)
+        self.zoom_out.setEnabled(self.zoom > 2)
+        latitude = unproject(self.center).lat
+        resolution = 2 * math.pi * EARTH_RADIUS_M * math.cos(math.radians(latitude)) / self.world_size
+        self.scale_bar.set_resolution(resolution)
 
     @property
     def world_size(self):
@@ -64,6 +146,7 @@ class RouteMap(QWidget):
     def move_view(self, center, zoom):
         self.center = QPointF(center.x() % 1, max(0, min(1, center.y())))
         self.zoom = zoom
+        self._refresh_controls()
         self.tile_timer.start()
         self.update()
 
@@ -78,29 +161,23 @@ class RouteMap(QWidget):
         if not self.points:
             return
         points = [self.origin + point for point in self._screen_points()]
-        projected = [point / self.world_size for point in points]
+        self.fit_projected([point / self.world_size for point in points])
+
+    def fit_projected(self, projected, *, padding=64, minimum_zoom=2):
         left, right = min(p.x() for p in projected), max(p.x() for p in projected)
         top, bottom = min(p.y() for p in projected), max(p.y() for p in projected)
-        scale = max((right - left) / max(1, self.width() - 64),
-                    (bottom - top) / max(1, self.height() - 64))
-        zoom = max(2, min(19, math.floor(-math.log2(TILE_SIZE * scale)))) if scale else 16
+        scale = max((right - left) / max(1, self.width() - padding),
+                    (bottom - top) / max(1, self.height() - padding))
+        zoom = max(minimum_zoom, min(19, math.floor(-math.log2(TILE_SIZE * scale)))) if scale else 16
         self.move_view(QPointF((left + right) / 2, (top + bottom) / 2), zoom)
 
     def resizeEvent(self, event):
+        self.scale_bar.move(12, self.height() - self.scale_bar.height() - 12)
         self.tile_timer.start()
         super().resizeEvent(event)
 
     def _visible_tiles(self):
-        origin = self.origin
-        count = 2 ** self.zoom
-        left = math.floor(origin.x() / TILE_SIZE)
-        right = math.ceil((origin.x() + self.width()) / TILE_SIZE)
-        top = max(0, math.floor(origin.y() / TILE_SIZE))
-        bottom = min(count, math.ceil((origin.y() + self.height()) / TILE_SIZE))
-        for x in range(left, right):
-            for y in range(top, bottom):
-                yield (self.zoom, x % count, y), QRectF(x * TILE_SIZE - origin.x(),
-                      y * TILE_SIZE - origin.y(), TILE_SIZE, TILE_SIZE)
+        return visible_tiles(self.origin, self.width(), self.height(), self.zoom, self.world_size)
 
     def request_tiles(self):
         self.tiles.show_tiles({key for key, _ in self._visible_tiles()})
@@ -136,6 +213,7 @@ class RouteMap(QWidget):
         if self.closed:
             path.closeSubpath()
         ink = QColor("#2057d2")
+        painter.setBrush(Qt.NoBrush)
         for color, width in ((QColor("white"), 7), (ink, 4)):
             painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
@@ -202,6 +280,14 @@ class RouteMap(QWidget):
             self.closed = not self.closed
             self._update_route()
 
+    def add_point(self, point):
+        if self.closed or len(self.points) >= MAX_ROUTE_POINTS:
+            return False
+        self.remember()
+        self.points.append(point)
+        self._update_route()
+        return True
+
     def _update_route(self):
         self.update()
         self.route_changed.emit()
@@ -246,8 +332,6 @@ class RouteMap(QWidget):
         if not self.dragged and not self.closed:
             if self.point_index == 0:
                 self.toggle_loop()
-            elif self.point_index is None and len(self.points) < MAX_ROUTE_POINTS:
-                self.remember()
-                self.points.append(unproject((self.origin + position) / self.world_size))
-                self._update_route()
+            elif self.point_index is None:
+                self.add_point(unproject((self.origin + position) / self.world_size))
         self.press = None

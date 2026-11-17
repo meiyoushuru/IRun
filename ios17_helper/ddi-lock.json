@@ -1,0 +1,23 @@
+{
+  "ref": "a1020f81b6429f5ce40408cbe21c690512b613b5",
+  "images": {
+    "Personalized": {
+      "build": "27B52",
+      "sha256": {
+        "BuildManifest.plist": "3c4eee2be4a0a853044dc32dbbd62699302b1dfd317aaf4f1cf36368b7639bb0",
+        "Image.dmg": "0de55b0ccde9d5790c9c9f4e1a413225443fce7ea75acb503aca11e7d8156646",
+        "Image.dmg.trustcache": "f0fb56da2829f69b8aae113584349635738e68d77c82a726ed72040890f16bf4"
+      }
+    },
+    "Cryptex": {
+      "build": "27B52",
+      "sha256": {
+        "BuildManifest.plist": "537391eb2f37e604fc693f422c1568af97220067853e663391ba3e8258569d6e",
+        "Image.dmg": "500d4139f7963650e6c796d950267ed38909e7d183ad26bba073257529bfe173",
+        "Image.dmg.trustcache": "2719aa3f1c99245432512116fb8a56d55ec224c706e545772d4c17c1233ac475",
+        "Image.dmg.cryptex_info": "0180ee20ce5daa7978fe38f24c742361726789ea6af82c3c1d2afc480734a531",
+        "Image.dmg.root_hash": "5f3281961396be5fe008e11641ffc25c7db24c11d3789ff0c4ff0fa6d47b94ca"
+      }
+    }
+  }
+}

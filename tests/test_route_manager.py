@@ -19,7 +19,8 @@ def test_manage_search_edit_rename_copy_and_delete(application, monkeypatch, tmp
     save_route(directory, "Loop", sample_route)
     points = (Point(30, 120), Point(30.001, 120), Point(30.001, 120.001))
     saved = save_route(directory, "Path", build_route(tmp_path / "path.gpx", points, closed=False))
-    window = Window(settings=QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat), poll=False)
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    window = Window(settings=settings, poll=False)
     completed = []
 
     def edit():

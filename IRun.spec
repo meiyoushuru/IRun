@@ -6,8 +6,9 @@ from PyInstaller.utils.win32.versioninfo import (
 )
 
 root = Path(SPECPATH)
-app_version = run_path(str(root / "vrun" / "__init__.py"))["__version__"]
-version_tuple = (*map(int, app_version.split(".")), 0)
+version_info = run_path(str(root / "vrun" / "__init__.py"))
+app_version = version_info["__version__"]
+version_tuple = version_info["WINDOWS_FILE_VERSION"]
 version = VSVersionInfo(
     ffi=FixedFileInfo(filevers=version_tuple, prodvers=version_tuple, mask=0x3F, flags=0,
                      OS=0x40004, fileType=1, subtype=0, date=(0, 0)),
@@ -27,9 +28,11 @@ a = Analysis(
     pathex=[str(root)],
     binaries=[],
     datas=[
-        (str(root / "libimobiledevice" / "win"), "libimobiledevice/win"),
-        (str(root / "DeveloperDiskImage"), "DeveloperDiskImage"),
-        (str(root / "assets"), "assets"),
+        *[(str(path), "libimobiledevice/win") for path in (root / "libimobiledevice" / "win").iterdir()
+          if path.suffix == ".dll" or path.name == "ideviceinfo.exe"],
+        *[(str(root / "assets" / name), "assets") for name in (
+            "check-dark.svg", "check-light.svg", "chevron-dark.svg", "chevron-light.svg", "irun.ico", "irun.png"
+        )],
     ],
     hiddenimports=["winotify"],
     hookspath=[],

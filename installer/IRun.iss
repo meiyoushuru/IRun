@@ -1,6 +1,18 @@
 ﻿; SPDX-License-Identifier: MPL-2.0
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.0.4"
+#endif
+#ifndef FileVersion
+  #define FileVersion "1.0.4.0"
+#endif
+#ifndef BundleDir
+  #define BundleDir "..\dist\IRun"
+#endif
+#ifndef ReleaseDir
+  #define ReleaseDir "..\release"
+#endif
+#ifndef EditionSuffix
+  #define EditionSuffix ""
 #endif
 [Setup]
 AppId={{BF65DE62-0A7C-48A4-B1E4-09B86F0B9457}
@@ -14,8 +26,8 @@ UsePreviousTasks=no
 DefaultGroupName=IRun
 DisableProgramGroupPage=yes
 AllowNoIcons=yes
-OutputDir=..\release
-OutputBaseFilename=IRun-{#AppVersion}-Setup-x64
+OutputDir={#ReleaseDir}
+OutputBaseFilename=IRun-{#AppVersion}{#EditionSuffix}-Setup-x64
 SetupIconFile=..\assets\irun.ico
 UninstallDisplayIcon={app}\IRun.exe
 LicenseFile=..\LICENSE
@@ -29,7 +41,7 @@ CloseApplications=yes
 CloseApplicationsFilter=*.exe,*.dll,*.pyd
 RestartApplications=no
 MinVersion=10.0.17763
-VersionInfoVersion={#AppVersion}.0
+VersionInfoVersion={#FileVersion}
 VersionInfoProductName=IRun
 
 [Languages]
@@ -53,10 +65,17 @@ chinesesimp.AppleIncomplete=Apple USB 组件尚未就绪。请检查网络后重
 Name: "desktopicon"; Description: "{cm:DesktopShortcut}"
 
 [Files]
-Source: "..\dist\IRun\*"; DestDir: "{app}"; Excludes: "routes\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BundleDir}\*"; DestDir: "{app}"; Excludes: "routes\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
+Type: files; Name: "{app}\_internal\assets\offline-maps.zip"
+Type: files; Name: "{app}\_internal\assets\maps\campus-osm.zip"
 Type: files; Name: "{app}\VRun.exe"
+Type: filesandordirs; Name: "{app}\_internal\DeveloperDiskImage"
+Type: files; Name: "{app}\_internal\libimobiledevice\win\idevicedevmodectl.exe"
+Type: files; Name: "{app}\_internal\libimobiledevice\win\ideviceimagemounter.exe"
+Type: files; Name: "{app}\_internal\libimobiledevice\win\idevicepair.exe"
+Type: files; Name: "{app}\_internal\libimobiledevice\win\idevicesetlocation.exe"
 Type: files; Name: "{app}\routes\HNroute.txt"
 Type: files; Name: "{app}\routes\ZJG-east.txt"
 Type: files; Name: "{app}\routes\ZJG-west.txt"

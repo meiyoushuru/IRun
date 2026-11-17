@@ -137,6 +137,59 @@ def usb_driver_staged() -> bool:
                for name in ("appleusb.inf", "usbaapl64.inf"))
 
 
+def apple_usb_status() -> str:
+    """Read Apple USB prerequisites without elevation or changing system state."""
+    if os.name != "nt":
+        return "Apple USB 自动检查仅适用于 Windows。"
+
+    def endpoint_available():
+        with socket.create_connection(("127.0.0.1", 27015), timeout=0.25):
+            return True
+
+    results = []
+    for label, check in (
+        ("Apple 移动设备服务注册", service_registered),
+        ("Apple USB 驱动已入库", usb_driver_staged),
+        ("Apple USB 通信端口 27015 可连接", endpoint_available),
+    ):
+        try:
+            result = "是" if check() else "否"
+        except ConnectionRefusedError:
+            result = "否（连接被拒绝）"
+        except (OSError, RuntimeError) as error:
+            result = f"无法检查（{error}）"
+        results.append(f"{label}：{result}")
+    return "\n".join(results)
+
+
+def apple_usb_device_status() -> str:
+    """Report Windows PnP status without exporting USB instance IDs."""
+    if os.name != "nt":
+        return "Apple USB 设备检查仅适用于 Windows。"
+    code = (
+        "$ErrorActionPreference='Stop';"
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "Get-CimInstance -Query \"SELECT PNPDeviceID, Service, ConfigManagerErrorCode FROM Win32_PnPEntity "
+        "WHERE Present = TRUE AND PNPDeviceID LIKE 'USB%VID[_]05AC%'\" | ForEach-Object {"
+        "'Service={0}, ConfigManagerErrorCode={1}' -f $_.Service, $_.ConfigManagerErrorCode}"
+    )
+    environment = os.environ.copy()
+    environment.pop("PSModulePath", None)
+    try:
+        directory = system_directory() / "WindowsPowerShell/v1.0"
+        result = subprocess.run(
+            [str(directory / "powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", code],
+            capture_output=True, timeout=5, env=environment,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        return f"无法读取 Windows Apple USB 设备状态（{type(error).__name__}）。"
+    if result.returncode:
+        details = result.stderr.decode("utf-8", errors="replace").strip()
+        return f"Windows Apple USB 设备检查失败（退出码 {result.returncode}）。\n{details[:4096]}"
+    return result.stdout.decode("utf-8-sig", errors="replace").strip() or "Windows 未枚举到当前连接的 Apple USB 设备。"
+
+
 def start_apple_service():
     run(["sc.exe", "start", APPLE_SERVICE], accepted=(0, 1056))
     deadline = time.monotonic() + 15

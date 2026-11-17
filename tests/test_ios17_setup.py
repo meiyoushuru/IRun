@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: MPL-2.0
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 import pytest
-from ios17_helper.main import Session, open_paired_usb
+from ios17_helper.main import Session, SetupHint, open_paired_usb
 
 
 @pytest.fixture
-def api(monkeypatch):
+def api(monkeypatch, tmp_path):
     import pymobiledevice3.lockdown as lockdown
     import pymobiledevice3.remote.userspace_tunnel as tunnel
     import pymobiledevice3.services.mobile_image_mounter as mounter
     import pymobiledevice3.services.dvt.instruments.dvt_provider as dvt
     import pymobiledevice3.services.dvt.instruments.location_simulation as location
     import pymobiledevice3.services.amfi as amfi
+    import pymobiledevice3.services.cryptexd as cryptex
 
     state = SimpleNamespace(
         lockdown=SimpleNamespace(udid="phone", product_version="17.6",
@@ -46,6 +48,9 @@ def api(monkeypatch):
         assert provider == "provider"
         yield state.location
     state.mount = AsyncMock()
+    state.download = AsyncMock()
+    state.base = tmp_path / "bundled"
+    state.cryptex_installed = False
     state.reveal = AsyncMock()
     monkeypatch.setattr(tunnel, "UserspaceRsdTunnel", userspace)
     state.legacy_image_probe = AsyncMock()
@@ -57,7 +62,14 @@ def api(monkeypatch):
     image_probe.IMAGE_TYPE = "Personalized"
     monkeypatch.setattr(mounter, "PersonalizedImageMounter", image_probe)
     monkeypatch.setattr(mounter, "uses_cryptex_image", lambda _: state.lockdown.product_version.startswith("27."))
-    monkeypatch.setattr(mounter, "auto_mount", state.mount)
+    async def installed():
+        return [SimpleNamespace(identifier=cryptex.DDI_CRYPTEX_IDENTIFIER)] if state.cryptex_installed else []
+    monkeypatch.setattr(cryptex, "CryptexdService", lambda _: SimpleNamespace(copy_installed=installed))
+    monkeypatch.setattr("ios17_helper.main.mount_image", state.mount)
+    monkeypatch.setattr("ios17_helper.main.validate_image", lambda *args: "27B52")
+    monkeypatch.setattr("ios17_helper.main.IMAGE_ROOT", state.base)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("ios17_helper.main.asyncio.to_thread", state.download)
     monkeypatch.setattr(dvt, "DvtProvider", provider)
     monkeypatch.setattr(location, "LocationSimulation", simulation)
     monkeypatch.setattr(amfi, "AmfiService", lambda _: SimpleNamespace(reveal_developer_mode_option_in_ui=state.reveal))
@@ -88,6 +100,7 @@ def test_save_pair_record_conflict_only_reuses_a_valid_pairing(api, monkeypatch,
     error = MuxException("usbmuxd rejected the SavePairRecord request: {'MessageType': 'Result', 'Number': 183}")
     api.lockdown.paired = paired
     api.create_lockdown.side_effect = [error, api.lockdown, api.lockdown]
+    monkeypatch.setattr("pymobiledevice3.pair_records.get_local_pairing_record", lambda *_: None)
     monkeypatch.setattr("ios17_helper.main.asyncio.sleep", AsyncMock())
     session = Session("phone")
     if paired:
@@ -107,6 +120,43 @@ def test_save_pair_record_conflict_only_reuses_a_valid_pairing(api, monkeypatch,
     ] * (1 if paired else 2)
 
 
+def test_save_pair_record_conflict_reuses_verified_local_record_for_tunnel(api, monkeypatch):
+    from pymobiledevice3.exceptions import MuxException
+    from pymobiledevice3.remote import userspace_tunnel
+
+    record = {"HostID": "local-host"}
+    api.lockdown.paired = True
+    api.create_lockdown.side_effect = [
+        MuxException("usbmuxd rejected the SavePairRecord request: {'Number': 183}"),
+        api.lockdown,
+    ]
+    records = iter([None, record])
+    monkeypatch.setattr("pymobiledevice3.pair_records.get_local_pairing_record", lambda *_: next(records))
+    connect = AsyncMock(return_value=api.lockdown)
+    monkeypatch.setattr(userspace_tunnel, "create_using_usbmux", connect)
+    original_tunnel = userspace_tunnel.UserspaceRsdTunnel
+
+    @asynccontextmanager
+    async def tunnel(**kwargs):
+        await userspace_tunnel.create_using_usbmux(serial=kwargs["serial"], autopair=kwargs["autopair"])
+        async with original_tunnel(**kwargs) as rsd:
+            yield rsd
+
+    monkeypatch.setattr(userspace_tunnel, "UserspaceRsdTunnel", tunnel)
+
+    async def scenario():
+        session = Session("phone")
+        try:
+            await session.open()
+            assert userspace_tunnel.create_using_usbmux is connect
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+    api.create_lockdown.assert_awaited_with(serial="phone", autopair=False, pair_record=record)
+    connect.assert_awaited_once_with(serial="phone", autopair=False, pair_record=record)
+
+
 def test_different_usbmux_error_is_not_retried(api):
     from pymobiledevice3.exceptions import MuxException
     api.create_lockdown.side_effect = MuxException("usbmuxd rejected the Connect request: {'Number': 183}")
@@ -120,17 +170,16 @@ def test_unmounted_image_is_prepared_in_tunnel(api):
         api.mounted = False
         session = Session("phone")
         await session.open()
-        api.mount.assert_awaited_once_with(api.rsd)
+        api.mount.assert_awaited_once_with(api.rsd, "Personalized", api.base / "Personalized")
+        api.download.assert_not_awaited()
         await session.close()
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("already_mounted", [False, True])
 def test_ios_27_checks_cryptex_without_legacy_image_probe(api, already_mounted):
-    from pymobiledevice3.exceptions import AlreadyMountedError
     api.lockdown.product_version = "27.3.1"
-    if already_mounted:
-        api.mount.side_effect = AlreadyMountedError("Cryptex is already installed")
+    api.cryptex_installed = already_mounted
 
     async def scenario():
         session = Session("phone")
@@ -140,15 +189,23 @@ def test_ios_27_checks_cryptex_without_legacy_image_probe(api, already_mounted):
 
     asyncio.run(scenario())
     api.legacy_image_probe.assert_not_awaited()
-    api.mount.assert_awaited_once_with(api.rsd)
+    if already_mounted:
+        api.mount.assert_not_awaited()
+    else:
+        api.mount.assert_awaited_once_with(api.rsd, "Cryptex", api.base / "Cryptex")
+    api.download.assert_not_awaited()
     api.location.clear.assert_awaited_once()
 
 
-def test_developer_mode_failure_reveals_setting_without_changing_location(api):
+@pytest.mark.parametrize("reveal_failed", [False, True])
+def test_developer_mode_failure_reveals_setting_without_changing_location(api, reveal_failed):
     async def scenario():
         api.lockdown.get_developer_mode_status.return_value = False
+        if reveal_failed:
+            api.reveal.side_effect = RuntimeError("AMFI service unavailable")
         session = Session("phone")
-        with pytest.raises(RuntimeError, match="Developer mode"):
+        hint = "Xcode" if reveal_failed else "已请求显示开关"
+        with pytest.raises(SetupHint, match=hint):
             await session.open()
         await session.close()
         api.reveal.assert_awaited_once()
@@ -156,6 +213,49 @@ def test_developer_mode_failure_reveals_setting_without_changing_location(api):
         assert api.tunnel_args == []
         api.lockdown.close.assert_awaited_once()
     asyncio.run(scenario())
+
+
+def test_failed_bundled_image_uses_online_then_cached_build(api, tmp_path):
+    api.mounted = False
+    cache = tmp_path / ".pymobiledevice3" / "IRun-DDI" / "Personalized" / "new-build"
+    api.download.return_value = cache
+    api.mount.side_effect = [ValueError("incompatible"), None, ValueError("incompatible"), None]
+
+    async def scenario():
+        for _ in range(2):
+            session = Session("phone")
+            try:
+                await session.open()
+            finally:
+                await session.close()
+            cache.mkdir(parents=True, exist_ok=True)
+
+    asyncio.run(scenario())
+    assert api.mount.await_args_list == [
+        call(api.rsd, "Personalized", api.base / "Personalized"),
+        call(api.rsd, "Personalized", cache),
+    ] * 2
+    api.download.assert_awaited_once()
+
+
+@pytest.mark.parametrize("admin, hint", [(False, "以管理员身份运行"), (True, "IPv6")])
+def test_early_ios17_failure_has_actionable_hint(api, monkeypatch, admin, hint):
+    api.lockdown.product_version = "17.3.1"
+    monkeypatch.setattr("ios17_helper.main.windows_admin", lambda: admin)
+    early_tunnel = AsyncMock(side_effect=TimeoutError)
+    monkeypatch.setattr(Session, "_early_tunnel", early_tunnel)
+
+    async def scenario():
+        session = Session("phone")
+        try:
+            with pytest.raises(SetupHint, match=hint):
+                await session.open()
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+    assert early_tunnel.await_count == int(admin)
+    api.download.assert_not_awaited()
 
 
 def test_wrong_tunnel_device_is_rejected_before_mount_or_location(api):

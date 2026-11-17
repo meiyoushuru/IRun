@@ -26,7 +26,10 @@ class ProbeWorker(QThread):
             self.detected.emit(self.backend.probe(self.cancel))
         except Cancelled:
             pass
+        except DeviceError as error:
+            self.unavailable.emit(str(error))
         except Exception as error:
+            LOG.exception("Unexpected device discovery failure")
             self.unavailable.emit(str(error))
 
 
@@ -83,6 +86,7 @@ class RunWorker(QThread):
         except Cancelled:
             pass
         except Exception as error:
+            LOG.exception("Device preparation or route playback failed")
             self.failed.emit(str(error))
         finally:
             if location_attempted and device is not None:
@@ -92,7 +96,7 @@ class RunWorker(QThread):
                     self.backend.reset(device)
                     self.restored.emit(True, RESET_SENT)
                 except Exception as error:
-                    LOG.warning("Location reset failed after playback: %s", type(error).__name__)
+                    LOG.exception("Location reset failed after playback")
                     self.restored.emit(False, "恢复定位失败：" + str(error) + " 请连接同一台手机后重试。")
             else:
                 self.restored.emit(True, "已停止。")
@@ -220,5 +224,5 @@ class RestoreWorker(QThread):
             self.backend.reset(self.device)
             self.restored.emit(True, RESET_SENT)
         except Exception as error:
-            LOG.warning("Manual location reset failed: %s", type(error).__name__)
+            LOG.exception("Manual location reset failed")
             self.restored.emit(False, "恢复定位失败：" + str(error) + " 请检查同一台手机的连接后重试。")

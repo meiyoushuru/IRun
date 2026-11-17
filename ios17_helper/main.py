@@ -11,17 +11,32 @@ import ctypes
 import json
 import logging
 import math
+from pathlib import Path
 import re
+import ssl
 import sys
+
+if __package__ is None and not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ios17_helper.images import (ROOT as IMAGE_ROOT, check_bundled_images, prepare_remote_image,
+                                 validate_image)
 
 LOG = logging.getLogger("IRun.iOS17")
 
 
+class SetupHint(RuntimeError):
+    pass
+
+
 def emit(**message):
+    if message.get("event") == "status":
+        LOG.info("%s", message["message"])
     print(json.dumps(message, ensure_ascii=True), flush=True)
 
 
 def explain(error):
+    if isinstance(error, SetupHint):
+        return str(error)
     name = type(error).__name__
     lower = (name + " " + str(error)).lower()
     if "developer" in lower and ("mode" in lower or "enabled" in lower):
@@ -37,17 +52,111 @@ def explain(error):
     return f"iOS 17+ 设备通信失败（{name}）：{str(error)[:350]}"
 
 
+def emit_error(identifier, error):
+    codes = {key: value for key in ("code", "status_code", "errno", "winerror")
+             if isinstance(value := getattr(error, key, None), int)}
+    emit(id=identifier, ok=False, error=explain(error), error_type=type(error).__name__,
+         detail=str(error)[:4096], codes=codes)
+
+
 def early_ios17(version):
     parts = tuple(int(value) for value in version.split(".")[:2])
     return parts < (17, 4)
 
 
-async def open_paired_usb(udid):
-    from pymobiledevice3.exceptions import MuxException
-    from pymobiledevice3.lockdown import create_using_usbmux
+def windows_admin():
+    return sys.platform != "win32" or bool(ctypes.windll.shell32.IsUserAnAdmin())
 
+
+async def mount_image(rsd, variant, directory):
+    from pymobiledevice3.exceptions import AlreadyMountedError
+    from pymobiledevice3.services.mobile_image_mounter import PersonalizedImageMounter
+    from pymobiledevice3.services.cryptexd import CryptexdService
+
+    with suppress(AlreadyMountedError):
+        if variant == "Cryptex":
+            await CryptexdService(rsd).auto_install_ddi(restore_dir=directory)
+        else:
+            async with PersonalizedImageMounter(rsd) as mounter:
+                await mounter.mount(directory / "Image.dmg", directory / "BuildManifest.plist",
+                                    directory / "Image.dmg.trustcache")
+
+
+async def prepare_developer_image(rsd):
+    from pymobiledevice3.services.mobile_image_mounter import PersonalizedImageMounter, uses_cryptex_image
+    from pymobiledevice3.services.cryptexd import CryptexdService, DDI_CRYPTEX_IDENTIFIER
+
+    cryptex = uses_cryptex_image(rsd)
+    if cryptex:
+        if any(image.identifier == DDI_CRYPTEX_IDENTIFIER for image in await CryptexdService(rsd).copy_installed()):
+            return
+    else:
+        async with PersonalizedImageMounter(rsd) as mounter:
+            if await mounter.is_image_mounted(PersonalizedImageMounter.IMAGE_TYPE):
+                return
+    variant = "Cryptex" if cryptex else "Personalized"
+    bundled = IMAGE_ROOT / variant
+    emit(event="status", message="正在使用预置开发者镜像…")
     try:
-        return await create_using_usbmux(serial=udid)
+        validate_image(bundled, variant)
+        await mount_image(rsd, variant, bundled)
+        return
+    except Exception:
+        LOG.warning("Bundled %s developer image could not be used", variant, exc_info=True)
+
+    cache = Path.home() / ".pymobiledevice3" / "IRun-DDI" / variant
+    cached = sorted((p for p in cache.glob("*") if p.is_dir() and not p.name.startswith("download-")),
+                    key=lambda p: p.stat().st_mtime)
+    for directory in cached[-1:]:
+        emit(event="status", message="正在尝试已下载的开发者镜像…")
+        try:
+            validate_image(directory, variant)
+            await mount_image(rsd, variant, directory)
+            return
+        except Exception:
+            LOG.warning("Cached %s developer image could not be used", variant, exc_info=True)
+
+    emit(event="status", message="本地镜像未能使用，正在从 GitHub 下载开发者镜像…")
+    try:
+        directory = await asyncio.to_thread(prepare_remote_image, cache, variant)
+    except Exception as error:
+        raise SetupHint("预置镜像未能使用，在线镜像也未能下载或校验。"
+                        "请检查电脑能否访问 raw.githubusercontent.com，然后重试。") from error
+    try:
+        await mount_image(rsd, variant, directory)
+    except Exception as error:
+        raise SetupHint("已下载开发者镜像，但设备未能接受。请检查 USB、开发者模式及苹果签名服务 "
+                        f"gs.apple.com 的网络连接，然后重试。详细信息：{str(error)[:190]}") from error
+
+
+async def open_paired_usb(udid):
+    from pymobiledevice3.exceptions import MuxException, PairingError
+    from pymobiledevice3.lockdown import create_using_usbmux
+    from pymobiledevice3.pair_records import create_pairing_records_cache_folder, get_local_pairing_record
+
+    async def open_local_record():
+        try:
+            record = get_local_pairing_record(udid, create_pairing_records_cache_folder())
+        except (OSError, ValueError):
+            return None
+        if not record:
+            return None
+        try:
+            connection = await create_using_usbmux(serial=udid, autopair=False, pair_record=record)
+        except (PairingError, ssl.SSLError, KeyError):
+            LOG.warning("Cached USB pairing record could not be validated", exc_info=True)
+            return None
+        if connection.paired and connection.udid == udid:
+            return connection, record
+        await connection.close()
+        return None
+
+    if sys.platform == "win32":
+        local = await open_local_record()
+        if local is not None:
+            return local
+    try:
+        return await create_using_usbmux(serial=udid), None
     except MuxException as error:
         # In the pinned library the plist result code is only present in the message.
         message = str(error)
@@ -56,15 +165,22 @@ async def open_paired_usb(udid):
                 or not re.search(r"['\"]Number['\"]:\s*183\b", message)):
             raise
         emit(event="status", message="正在重新验证 Windows 上已有的 USB 配对记录…")
+        # Pairing writes the local copy before asking Windows to save its copy.
+        # Default lookup may keep picking an older Windows record first.
+        local = await open_local_record()
+        if local is not None:
+            return local
         for delay in (0.25, 0.75):
             await asyncio.sleep(delay)
             connection = await create_using_usbmux(serial=udid, autopair=False)
             if connection.paired and connection.udid == udid:
-                return connection
+                return connection, None
             await connection.close()
-        raise RuntimeError(
-            "Windows 上已有 USB 配对记录，但未能验证（SavePairRecord 183）。"
-            "请解锁设备、重新插拔 USB，并在出现提示时确认「信任此电脑」，再点击开始。"
+        raise SetupHint(
+            "USB 配对记录未通过验证（SavePairRecord 183）。"
+            "请解锁设备，打开 Windows 上的「Apple 设备」或 iTunes，"
+            "确认能看到这台设备并在手机上选择「信任此电脑」，再回到 IRun 点击开始。"
+            "配对成功后，IRun 才能检查并尝试显示「开发者模式」开关。"
         ) from error
 
 
@@ -76,48 +192,59 @@ class Session:
         self.location_attempted = False
 
     async def open(self):
-        from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
+        from pymobiledevice3.remote import userspace_tunnel
         from pymobiledevice3.services.amfi import AmfiService
         from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
         from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
-        from pymobiledevice3.services.mobile_image_mounter import (
-            auto_mount, PersonalizedImageMounter, uses_cryptex_image,
-        )
-        from pymobiledevice3.exceptions import AlreadyMountedError
 
-        emit(event="status", message="正在检查 iOS 17+ 设备与开发者模式…")
-        lockdown = await open_paired_usb(self.udid)
+        emit(event="status", message="正在验证 USB 配对，请保持设备解锁…")
+        lockdown, recovered_record = await open_paired_usb(self.udid)
         self.stack.push_async_callback(lockdown.close)
         if lockdown.udid != self.udid:
             raise RuntimeError("设备标识不匹配，已取消连接。")
         version = lockdown.product_version
         if int(version.split(".")[0]) < 17:
-            raise RuntimeError("此组件仅用于 iOS 17+，旧版设备应使用原有连接方式。")
+            raise SetupHint(f"当前设备系统为 {version}。IRun 需要 iOS 或 iPadOS 17 及以上。")
+        emit(event="status", message="USB 配对已通过，正在检查开发者模式…")
         if not await lockdown.get_developer_mode_status():
-            with suppress(Exception):
+            try:
                 await AmfiService(lockdown).reveal_developer_mode_option_in_ui()
-            raise RuntimeError("Developer mode is not enabled")
+            except Exception as error:
+                LOG.warning("Could not reveal the Developer Mode setting", exc_info=True)
+                raise SetupHint(
+                    "开发者模式未开启，IRun 未能显示开关。请保持设备解锁并重新连接后重试。"
+                    "如果「设置 → 隐私与安全性」里仍无此项，可连接运行 Xcode 的 Mac 发起设备配对，"
+                    "再回到设备上开启开发者模式并在重启后确认。"
+                ) from error
+            raise SetupHint(
+                "开发者模式未开启，已请求显示开关。请在设备上打开「设置 → 隐私与安全性 → 开发者模式」，"
+                "开启后按提示重启，解锁并确认「打开」，再重新连接 IRun。"
+            )
         if early_ios17(version):
-            if sys.platform == "win32" and not ctypes.windll.shell32.IsUserAnAdmin():
-                raise RuntimeError("iOS 17.0–17.3 需要管理员权限建立隧道。请停止任务并关闭 IRun，右键选择“以管理员身份运行”。")
-            rsd = await self._early_tunnel()
+            if not windows_admin():
+                raise SetupHint("iOS 17.0–17.3.x 需要管理员权限。请退出 IRun，右键快捷方式，选择「以管理员身份运行」。")
+            try:
+                rsd = await asyncio.wait_for(self._early_tunnel(), 45)
+            except Exception as error:
+                raise SetupHint("无法建立 iOS 17.0–17.3.x 开发者连接。请检查设备管理器中的 Apple 网络设备驱动，"
+                                "确认 Windows 网络适配器已启用 IPv6，重新插拔 USB 后重试。") from error
         else:
             emit(event="status", message="正在建立 iOS 17.4+ USB 开发者隧道…")
-            rsd = await self.stack.enter_async_context(
-                UserspaceRsdTunnel(serial=self.udid, autopair=False, remotepairing_fallback=False))
+            tunnel = userspace_tunnel.UserspaceRsdTunnel(
+                serial=self.udid, autopair=False, remotepairing_fallback=False)
+            original_connect = userspace_tunnel.create_using_usbmux
+            if recovered_record is not None:
+                from functools import partial
+                # The pinned tunnel opens a second lockdown connection. Keep its lookup
+                # on the verified record for this one session in the helper subprocess.
+                userspace_tunnel.create_using_usbmux = partial(original_connect, pair_record=recovered_record)
+            try:
+                rsd = await self.stack.enter_async_context(tunnel)
+            finally:
+                userspace_tunnel.create_using_usbmux = original_connect
         if rsd.udid != self.udid:
             raise RuntimeError("开发者隧道连接到了其他设备，已停止。")
-        emit(event="status", message="正在检查开发者镜像；首次准备可能需要联网下载，请稍候…")
-        if uses_cryptex_image(rsd):
-            # The library checks the Cryptex registration before downloading or installing it.
-            with suppress(AlreadyMountedError):
-                await auto_mount(rsd)
-        else:
-            async with PersonalizedImageMounter(rsd) as mounter:
-                mounted = await mounter.is_image_mounted(PersonalizedImageMounter.IMAGE_TYPE)
-            if not mounted:
-                with suppress(AlreadyMountedError):
-                    await auto_mount(rsd)
+        await prepare_developer_image(rsd)
         provider = await self.stack.enter_async_context(DvtProvider(rsd))
         self.location = await self.stack.enter_async_context(LocationSimulation(provider))
 
@@ -181,10 +308,10 @@ async def serve(udid):
                 emit(id=identifier, ok=True)
             except Exception as error:
                 LOG.exception("Location operation failed")
-                emit(id=identifier, ok=False, error=explain(error))
+                emit_error(identifier, error)
     except Exception as error:
         LOG.exception("Developer service setup failed")
-        emit(id=0, ok=False, error=explain(error))
+        emit_error(0, error)
         return 1
     finally:
         try:
@@ -195,8 +322,6 @@ async def serve(udid):
 
 
 def check_dependencies():
-    import ssl
-    from pathlib import Path
     from importlib.metadata import version
     from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
     from pymobiledevice3.remote.tunnel_service import get_core_device_tunnel_services, start_tunnel
@@ -213,7 +338,9 @@ def check_dependencies():
         wintun = Path(pytun_pmd3.__file__).parent / "wintun" / "bin" / "amd64" / "wintun.dll"
         if not wintun.is_file():
             raise RuntimeError("安装包缺少 64 位 Wintun 组件。")
-    emit(ok=True, version=version("pymobiledevice3"), protocol=1)
+    images = check_bundled_images()["images"]
+    emit(ok=True, version=version("pymobiledevice3"), protocol=1,
+         images={variant: entry["build"] for variant, entry in images.items()})
     return 0
 
 
@@ -222,7 +349,9 @@ def main():
     parser.add_argument("--udid")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    logging.basicConfig(stream=sys.stderr, encoding="utf-8", level=logging.WARNING)
+    logging.basicConfig(stream=sys.stderr, encoding="utf-8", level=logging.WARNING,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    LOG.setLevel(logging.INFO)
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
@@ -234,7 +363,7 @@ def main():
         return asyncio.run(serve(args.udid))
     except Exception as error:
         LOG.exception("iOS 17 helper failed")
-        emit(id=0, ok=False, error=explain(error))
+        emit_error(0, error)
         return 1
 
 
