@@ -60,17 +60,25 @@ class MapScale(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(QColor(self.colors["border"]))
-        painter.setBrush(QColor(self.colors["surface"]))
-        painter.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 6, 6)
-        painter.setPen(QColor(self.colors["text"]))
-        painter.drawText(QRectF(10, 4, self.width() - 18, 22), Qt.AlignLeft | Qt.AlignVCenter, self.label)
-        painter.setPen(QPen(QColor(self.colors["text"]), 1.5))
+        ink = QColor(self.colors["text"])
+        halo = QColor(self.colors["surface"])
+        metrics = painter.fontMetrics()
+        baseline = 15 + (metrics.ascent() - metrics.descent()) / 2
+        text = QPainterPath()
+        text.addText(QPointF(10, baseline), painter.font(), self.label)
+        painter.strokePath(text, QPen(halo, 2))
+        painter.fillPath(text, ink)
+
+        bar = QPainterPath()
         start = QPointF(11, 32)
         end = start + QPointF(self.pixels, 0)
-        painter.drawLine(start, end)
+        bar.moveTo(start)
+        bar.lineTo(end)
         for mark in (start, end):
-            painter.drawLine(mark - QPointF(0, 4), mark + QPointF(0, 2))
+            bar.moveTo(mark - QPointF(0, 4))
+            bar.lineTo(mark + QPointF(0, 2))
+        painter.strokePath(bar, QPen(halo, 3.5))
+        painter.strokePath(bar, QPen(ink, 1.5))
 
 
 class RouteMap(QWidget):

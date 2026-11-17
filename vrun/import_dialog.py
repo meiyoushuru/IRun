@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MPL-2.0
 from PySide6.QtCore import QSignalBlocker, Qt
-from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QLabel, QLineEdit, QVBoxLayout
+from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout
 
+from .map_preview import MapRoutePreview
 from .route_library import MAX_ROUTE_NAME_LENGTH
 from .routes import build_route
-from .widgets import ChoiceBox, RoutePreview
+from .widgets import ChoiceBox
 
 
 class ImportRouteDialog(QDialog):
@@ -34,13 +35,16 @@ class ImportRouteDialog(QDialog):
         layout.addWidget(self.name)
         self.close_route = QCheckBox("保存为闭合环线")
         layout.addWidget(self.close_route)
-        self.preview = RoutePreview()
+        self.preview = MapRoutePreview(parent=self)
         self.preview.colors = colors
         layout.addWidget(self.preview, 1)
         self.summary = QLabel()
         self.summary.setTextFormat(Qt.PlainText)
         self.summary.setWordWrap(True)
-        layout.addWidget(self.summary)
+        footer = QHBoxLayout()
+        footer.addWidget(self.summary, 1)
+        footer.addWidget(self.preview.create_attribution_label(self))
+        layout.addLayout(footer)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.save_button = buttons.button(QDialogButtonBox.Save)
         buttons.button(QDialogButtonBox.Cancel).setText("取消")

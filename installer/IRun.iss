@@ -1,9 +1,9 @@
 ﻿; SPDX-License-Identifier: MPL-2.0
 #ifndef AppVersion
-  #define AppVersion "1.0.4"
+  #define AppVersion "1.1.0"
 #endif
 #ifndef FileVersion
-  #define FileVersion "1.0.4.0"
+  #define FileVersion "1.1.0.0"
 #endif
 #ifndef BundleDir
   #define BundleDir "..\dist\IRun"

@@ -1,26 +1,48 @@
 # SPDX-License-Identifier: MPL-2.0
-"""Non-interactive route playback over a fitted OpenStreetMap basemap."""
+"""Non-interactive route previews over a fitted OpenStreetMap basemap."""
 import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainterPath, QPen
+from PySide6.QtWidgets import QLabel
 
 from .map_tiles import MapTiles
+from .offline_maps import OSM_ATTRIBUTION
+from .paths import local_data_root
 from .route_map import TILE_SIZE, project, visible_tiles
 from .widgets import RoutePreview
 
 
 class MapRoutePreview(RoutePreview):
-    def __init__(self, cache_dir, parent=None):
+    def __init__(self, cache_dir=None, parent=None):
         super().__init__(parent)
+        if cache_dir is None:
+            cache_dir = local_data_root() / "IRun" / "map-cache"
         self.tiles = MapTiles(cache_dir, self)
-        self.tiles.changed.connect(self.update)
+        self.tiles.changed.connect(self._tiles_changed)
         self._projected = []
         self._view = None
         self._tile_timer = QTimer(self)
         self._tile_timer.setSingleShot(True)
         self._tile_timer.setInterval(150)
         self._tile_timer.timeout.connect(self._request_tiles)
+
+    def create_attribution_label(self, parent):
+        url, name = OSM_ATTRIBUTION
+        label = QLabel(f'<a href="{url}">© OpenStreetMap</a>', parent)
+        label.setObjectName("muted")
+        label.setOpenExternalLinks(True)
+        label.setToolTip(name)
+        label.setVisible(bool(self.tiles.images))
+        self.tiles.changed.connect(lambda: label.setVisible(bool(self.tiles.images)))
+        return label
+
+    def _tiles_changed(self):
+        self.setToolTip(
+            "OpenStreetMap 底图加载失败。请检查是否使用了能访问该服务的网络代理。"
+            if self.tiles.failed else ""
+        )
+        self.update()
 
     def set_route(self, route, **kwargs):
         super().set_route(route, **kwargs)

@@ -5,9 +5,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QPushButton, QVBoxLayout)
 
+from .map_preview import MapRoutePreview
 from .route_library import load_saved_route
 from .routes import load_route
-from .widgets import ChoiceBox, RoutePreview
+from .widgets import ChoiceBox
 
 
 class RouteManagerDialog(QDialog):
@@ -37,13 +38,16 @@ class RouteManagerDialog(QDialog):
         self.routes.setAlternatingRowColors(True)
         content.addWidget(self.routes, 2)
         details = QVBoxLayout()
-        self.preview = RoutePreview()
+        self.preview = MapRoutePreview(parent=self)
         self.preview.colors = colors
         details.addWidget(self.preview, 1)
         self.summary = QLabel()
         self.summary.setTextFormat(Qt.PlainText)
         self.summary.setWordWrap(True)
-        details.addWidget(self.summary)
+        footer = QHBoxLayout()
+        footer.addWidget(self.summary, 1)
+        footer.addWidget(self.preview.create_attribution_label(self))
+        details.addLayout(footer)
         content.addLayout(details, 3)
         layout.addLayout(content, 1)
 

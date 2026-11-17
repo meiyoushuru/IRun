@@ -15,10 +15,12 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
 
 from vrun.app import Window
 from vrun.draw_dialog import DrawRouteDialog, PRESET_SETTING
+from vrun.import_dialog import ImportRouteDialog
+from vrun.manage_dialog import RouteManagerDialog
 from vrun.map_preview import MapRoutePreview
 from vrun.map_tiles import MapTiles
 from vrun.offline_maps import OFFLINE_MAP_ASSET, OfflineMaps
-from vrun.route_library import export_gpx, load_gpx
+from vrun.route_library import GpxSegment, export_gpx, load_gpx, save_route
 from vrun.route_map import project, unproject
 from vrun.routes import Point, build_route
 
@@ -221,6 +223,40 @@ def test_main_map_preview_fits_route_and_uses_offline_tiles(application, tmp_pat
     finally:
         preview.deleteLater()
         QCoreApplication.sendPostedEvents(preview, QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize("manage", [True, False])
+def test_route_dialog_displays_basemap(application, tmp_path, monkeypatch, bundled_maps, manage):
+    from PySide6.QtWidgets import QLabel
+    from vrun import theme
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    colors = theme.colors("light")
+    path = tmp_path / "preview.gpx"
+    points = (Point(0.001, 0.001), Point(0.002, 0.002), Point(0.001, 0.002))
+    if manage:
+        dialog = RouteManagerDialog(colors)
+        saved = save_route(tmp_path / "routes", "示例路线", build_route(path, points, closed=False))
+        dialog.set_entries([("示例路线", str(saved), False)], str(saved))
+    else:
+        dialog = ImportRouteDialog(path, [GpxSegment("示例路线", "轨迹", points)], colors)
+        dialog.close_route.setChecked(True)
+        assert dialog.preview.show_closing_segment
+
+    try:
+        dialog.show()
+        application.processEvents()
+        preview = dialog.preview
+        preview._request_tiles()
+        assert preview.tiles.offline_visible
+        assert not preview.tiles.pending
+        assert preview.grab().toImage().pixelColor(16, 16) == Qt.white
+        assert any(widget.isVisible() and "© OpenStreetMap" in widget.text()
+                   for widget in dialog.findChildren(QLabel))
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QCoreApplication.sendPostedEvents(dialog, QEvent.DeferredDelete)
 
 
 def test_closed_route_preserves_the_basemap_inside_the_outline(application, tmp_path):

@@ -22,7 +22,6 @@ from .draw_dialog import DrawRouteDialog, choose_gpx_destination
 from .import_dialog import ImportRouteDialog
 from .manage_dialog import RouteManagerDialog
 from .map_preview import MapRoutePreview
-from .offline_maps import OSM_ATTRIBUTION
 from .paths import app_dir, data_dir, local_data_root, resource_dir
 from .route_library import (MAX_ROUTE_NAME_LENGTH, load_gpx, load_saved_route, read_saved_route,
                             rename_route, route_name_key, save_route, unique_route_name)
@@ -210,7 +209,7 @@ class Window(QMainWindow):
         self.export_button.clicked.connect(self._export_route)
         route_actions.addWidget(self.export_button)
         route_layout.addLayout(route_actions)
-        self.preview = MapRoutePreview(local_data_root() / "IRun" / "map-cache")
+        self.preview = MapRoutePreview(parent=self)
         route_layout.addWidget(self.preview, 1)
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("lapProgress")
@@ -221,18 +220,10 @@ class Window(QMainWindow):
         route_layout.addWidget(self.progress_bar)
         self.route_info = label("", "muted")
         self.route_info.setWordWrap(True)
-        self.map_attribution = QLabel()
-        self.map_attribution.setObjectName("muted")
-        self.map_attribution.setOpenExternalLinks(True)
-        url, attribution = OSM_ATTRIBUTION
-        self.map_attribution.setText(f'<a href="{url}">© OpenStreetMap</a>')
-        self.map_attribution.setToolTip(attribution)
-        self.map_attribution.hide()
         map_footer = QHBoxLayout()
         map_footer.addWidget(self.route_info, 1)
-        map_footer.addWidget(self.map_attribution)
+        map_footer.addWidget(self.preview.create_attribution_label(self))
         route_layout.addLayout(map_footer)
-        self.preview.tiles.changed.connect(self._update_preview_map_status)
         middle.addWidget(self.route_card, 1)
 
         options_card, options = card()
@@ -656,14 +647,6 @@ class Window(QMainWindow):
         self._on_progress(0)
         self._update_start_button()
         self.export_button.setEnabled(self.route is not None and self.worker is None)
-
-    def _update_preview_map_status(self):
-        tiles = self.preview.tiles
-        self.map_attribution.setVisible(bool(tiles.images))
-        self.preview.setToolTip(
-            "OpenStreetMap 底图加载失败。请检查是否使用了能访问该服务的网络代理。"
-            if tiles.failed else ""
-        )
 
     def _clear_stats(self):
         self.laps.setText("0")
