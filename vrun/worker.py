@@ -5,11 +5,20 @@ from time import monotonic
 
 from PySide6.QtCore import QThread, Signal
 
-from .device import Cancelled, DeviceBackend, DeviceError
+from .device import END_ACTION, Cancelled, DeviceBackend, DeviceError
+from .diagnostics import error_summary
 from .routes import LapCounter, Route
 
 LOG = logging.getLogger(__name__)
-RESET_SENT = "已发送停止模拟命令。请在设备的地图 App 中确认当前位置。"
+RESET_SENT = "已发送恢复定位指令。设备可能需要几秒刷新位置，请在 iPhone 或 iPad 的地图 App 中确认当前位置。"
+SETUP_STOPPED = "已取消启动。准备好后可再次点击「开始」。"
+
+
+def restore_failure(error):
+    message = f"未能恢复定位。请重新连接刚才使用的设备，再点击「{END_ACTION}」。"
+    if isinstance(error, DeviceError):
+        return f"{message}\n{error}"
+    return error_summary(message, error)
 
 
 class ProbeWorker(QThread):
@@ -30,7 +39,8 @@ class ProbeWorker(QThread):
             self.unavailable.emit(str(error))
         except Exception as error:
             LOG.exception("Unexpected device discovery failure")
-            self.unavailable.emit(str(error))
+            self.unavailable.emit(error_summary(
+                "无法读取设备信息。请重新插拔 USB 线。如果仍失败，请点击「导出诊断日志」。", error))
 
 
 class RunWorker(QThread):
@@ -42,6 +52,7 @@ class RunWorker(QThread):
     pause_changed = Signal(bool)
     target_reached = Signal(float)
     failed = Signal(str)
+    restoring = Signal()
     restored = Signal(bool, str)
 
     def __init__(self, backend: DeviceBackend, route: Route, speed: float,
@@ -87,19 +98,21 @@ class RunWorker(QThread):
             pass
         except Exception as error:
             LOG.exception("Device preparation or route playback failed")
-            self.failed.emit(str(error))
+            self.failed.emit(str(error) if isinstance(error, DeviceError) else error_summary(
+                "模拟已中断。请重新连接设备。如果仍失败，请点击「导出诊断日志」。", error))
         finally:
             if location_attempted and device is not None:
-                self.message.emit("正在恢复手机正常定位…")
+                self.restoring.emit()
+                self.message.emit("正在恢复设备的正常定位，请保持 USB 连接并稍候…")
                 LOG.info("Starting location reset after playback")
                 try:
                     self.backend.reset(device)
                     self.restored.emit(True, RESET_SENT)
                 except Exception as error:
                     LOG.exception("Location reset failed after playback")
-                    self.restored.emit(False, "恢复定位失败：" + str(error) + " 请连接同一台手机后重试。")
+                    self.restored.emit(False, restore_failure(error))
             else:
-                self.restored.emit(True, "已停止。")
+                self.restored.emit(True, SETUP_STOPPED)
             close = getattr(self.backend, "close", None)
             if close:
                 close()
@@ -225,4 +238,4 @@ class RestoreWorker(QThread):
             self.restored.emit(True, RESET_SENT)
         except Exception as error:
             LOG.exception("Manual location reset failed")
-            self.restored.emit(False, "恢复定位失败：" + str(error) + " 请检查同一台手机的连接后重试。")
+            self.restored.emit(False, restore_failure(error))

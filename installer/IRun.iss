@@ -1,9 +1,9 @@
 ﻿; SPDX-License-Identifier: MPL-2.0
 #ifndef AppVersion
-  #define AppVersion "1.1.0"
+  #define AppVersion "1.2.0"
 #endif
 #ifndef FileVersion
-  #define FileVersion "1.1.0.0"
+  #define FileVersion "1.2.0.0"
 #endif
 #ifndef BundleDir
   #define BundleDir "..\dist\IRun"
@@ -56,10 +56,10 @@ english.DesktopShortcut=Create a desktop shortcut
 chinesesimp.DesktopShortcut=创建桌面快捷方式
 english.LaunchIRun=Launch IRun
 chinesesimp.LaunchIRun=启动 IRun
-english.PreparingApple=Preparing Apple USB components. This may take a few minutes...
-chinesesimp.PreparingApple=正在准备 Apple USB 驱动与通信组件，可能需要几分钟，请稍候…
-english.AppleIncomplete=IRun cannot connect to an iPhone until Apple USB setup succeeds. Check the network and run Setup again. Log:
-chinesesimp.AppleIncomplete=Apple USB 组件尚未就绪。请检查网络后重新运行安装包。日志：
+english.PreparingApple=Setting up Apple USB support on this PC. Please wait a few minutes...
+chinesesimp.PreparingApple=正在电脑上配置 Apple USB 连接组件，可能需要几分钟，请稍候…
+english.AppleIncomplete=Apple USB setup failed on this PC. Check your internet connection and run the IRun installer again. Setup log:
+chinesesimp.AppleIncomplete=电脑未能完成 Apple USB 组件配置。请检查电脑网络后重新运行 IRun 安装包。安装日志见下方。
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:DesktopShortcut}"

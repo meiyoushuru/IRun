@@ -1,14 +1,71 @@
 # SPDX-License-Identifier: MPL-2.0
+from decimal import Decimal, ROUND_HALF_UP
 import math
-from PySide6.QtCore import (QEvent, QLocale, QPoint, QPointF, QRectF, QRegularExpression,
-                            QSize, Qt, QTimer, QVariantAnimation, Signal)
+from PySide6.QtCore import (QEasingCurve, QEvent, QLocale, QPoint, QPointF, QRectF, QRegularExpression,
+                            QSignalBlocker, QSize, Qt, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QDoubleValidator, QPainter, QPainterPath, QPen,
                            QRegularExpressionValidator)
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QLineEdit, QListView,
-                                QSizePolicy, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
+                               QLineEdit, QListView, QPushButton, QSizePolicy, QStyle, QStyledItemDelegate,
+                               QVBoxLayout, QWidget)
 
 from . import theme
-from .routes import longitude_delta
+from .routes import longitude_delta, pace_seconds
+
+
+class MapDialog(QDialog):
+    def __init__(self, parent, width, height):
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint)
+        available = self.screen().availableSize() - QSize(40, 64)
+        self.resize(QSize(width, height).boundedTo(available))
+
+
+class RunButton(QPushButton):
+    def __init__(self):
+        super().__init__("开始")
+        self.setObjectName("start")
+        self.setMinimumWidth(108)
+        self.setEnabled(False)
+        self.colors = {}
+        self.transition = QVariantAnimation(self)
+        self.transition.setDuration(200)
+        self.transition.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.transition.setStartValue(0.0)
+        self.transition.setEndValue(1.0)
+        self.transition.valueChanged.connect(self._paint_transition)
+        self.transition.finished.connect(lambda: self.setStyleSheet(""))
+
+    def set_colors(self, colors):
+        self.colors = colors
+        self._stop_transition()
+
+    def set_action(self, text, enabled):
+        was_enabled = self.isEnabled()
+        self.setText(text)
+        self.setEnabled(enabled)
+        if not enabled or text != "开始":
+            self._stop_transition()
+        elif not was_enabled and self.colors:
+            self._paint_transition(0)
+            self.transition.start()
+
+    def _stop_transition(self):
+        self.transition.stop()
+        if self.styleSheet():
+            self.setStyleSheet("")
+
+    def _paint_transition(self, fraction):
+        def blend(start, end):
+            start, end = QColor(self.colors[start]), QColor(self.colors[end])
+            return QColor.fromRgbF(*(a + (b - a) * fraction for a, b in
+                                    zip(start.getRgbF()[:3], end.getRgbF()[:3])))
+
+        background = blend("disabled_bg", "accent")
+        border = blend("border", "accent")
+        ink = max((QColor("white"), QColor("#111723")), key=lambda color: theme.contrast(color, background))
+        self.setStyleSheet(f"QPushButton#start {{ background: {background.name()}; "
+                           f"border-color: {border.name()}; color: {ink.name()}; }}")
 
 
 class ChoiceRow(QStyledItemDelegate):
@@ -76,6 +133,7 @@ class ChoiceBox(QComboBox):
         layout.setContentsMargins(6, 6, 6, 6)
         self._choices = QListView(self._popup)
         self._choices.setObjectName("choiceRows")
+        self._choices.setFrameShape(QFrame.NoFrame)
         self._choices.setMouseTracking(True)
         self._choices.setUniformItemSizes(True)
         self._choices.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
@@ -87,7 +145,7 @@ class ChoiceBox(QComboBox):
         self._choices.installEventFilter(self)
         self._choices.clicked.connect(self._commit)
         self._popup.closed.connect(self._popup_closed)
-        self.set_popup_colors(theme.colors("system"))
+        self.set_popup_colors(theme.colors())
 
     def set_popup_colors(self, colors):
         self.popup_colors = colors
@@ -122,12 +180,14 @@ class ChoiceBox(QComboBox):
         self._choices.setCurrentIndex(index)
         top = self.mapToGlobal(QPoint(0, 0))
         screen = self.screen().availableGeometry()
-        height = min(self.count(), self.maxVisibleItems()) * ChoiceRow.height + 12
+        margins = self._popup.layout().contentsMargins()
+        padding = margins.top() + margins.bottom()
+        height = min(self.count(), self.maxVisibleItems()) * ChoiceRow.height + padding
         below = screen.bottom() - (top.y() + self.height()) - 4
         above = top.y() - screen.top() - 4
         open_below = below >= height or below >= above
-        rows_that_fit = max(1, ((below if open_below else above) - 12) // ChoiceRow.height)
-        height = min(height, rows_that_fit * ChoiceRow.height + 12)
+        rows_that_fit = max(1, ((below if open_below else above) - padding) // ChoiceRow.height)
+        height = min(height, rows_that_fit * ChoiceRow.height + padding)
         width = min(self.width(), screen.width())
         x = max(screen.left(), min(top.x(), screen.right() - width + 1))
         y = top.y() + self.height() + 4 if open_below else top.y() - height - 4
@@ -195,45 +255,78 @@ class SpeedInput(QLineEdit):
         super().__init__(parent)
         validator = QDoubleValidator(0.1, 15.0, 2, self)
         validator.setNotation(QDoubleValidator.StandardNotation)
-        validator.setLocale(QLocale.c())
+        locale = QLocale.c()
+        locale.setNumberOptions(QLocale.RejectGroupSeparator)
+        validator.setLocale(locale)
         self.setValidator(validator)
-        self.setMaxLength(8)
-        self.setTextMargins(0, 0, 40, 0)
-        self.unit_color = QColor("#71839c")
+        self.setFixedWidth(85)
+        self.setAlignment(Qt.AlignCenter)
         self.textChanged.connect(lambda _: self.valueChanged.emit(self.value()))
+        self.editingFinished.connect(self._format_input)
 
     def value(self):
-        try:
-            return float(self.text())
-        except ValueError:
+        if not self.hasAcceptableInput():
             return math.nan
+        value, _ = self.validator().locale().toDouble(self.text())
+        return value
 
     def setValue(self, value):
-        self.setText(f"{value:.2f}")
+        rounded = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        self.setText(f"{rounded:.2f}")
+
+    def _format_input(self):
+        if self.hasAcceptableInput():
+            with QSignalBlocker(self):
+                self.setValue(self.value())
 
     def wheelEvent(self, event):
         event.ignore()
 
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setPen(self.unit_color)
-        painter.drawText(self.rect().adjusted(0, 0, -12, 0), Qt.AlignRight | Qt.AlignVCenter, "m/s")
+class PaceInput(QWidget):
+    valueChanged = Signal(float)
 
-
-class PaceInput(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setValidator(QRegularExpressionValidator(QRegularExpression(r"[0-9]{1,3}:[0-5][0-9]"), self))
-        self.setMaxLength(6)
-        self.setPlaceholderText("分:秒")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.minutes = QLineEdit()
+        self.seconds = QLineEdit()
+        for field, unit, pattern in (
+            (self.minutes, "分", r"[0-9]{1,3}"),
+            (self.seconds, "秒/公里", r"[0-5]?[0-9]"),
+        ):
+            field.setFixedWidth(55)
+            field.setAlignment(Qt.AlignCenter)
+            field.setAccessibleName(f"运动配速（{unit}）")
+            field.setValidator(QRegularExpressionValidator(QRegularExpression(pattern), field))
+            field.textChanged.connect(self._emit_value)
+            row.addWidget(field)
+            unit_label = QLabel(unit)
+            unit_label.setObjectName("muted")
+            row.addWidget(unit_label)
+        row.addStretch()
+        self.seconds.editingFinished.connect(self._format_seconds)
 
     def speed(self):
-        if not self.hasAcceptableInput():
+        if not self.minutes.hasAcceptableInput() or not self.seconds.hasAcceptableInput():
             return math.nan
-        minutes, seconds = map(int, self.text().split(":"))
-        total = minutes * 60 + seconds
+        total = int(self.minutes.text()) * 60 + int(self.seconds.text())
         return 1000 / total if total else math.nan
+
+    def set_speed(self, speed):
+        minutes, seconds = divmod(pace_seconds(speed), 60)
+        with QSignalBlocker(self.minutes), QSignalBlocker(self.seconds):
+            self.minutes.setText(str(minutes))
+            self.seconds.setText(f"{seconds:02d}")
+
+    def _emit_value(self):
+        self.valueChanged.emit(self.speed())
+
+    def _format_seconds(self):
+        if self.seconds.hasAcceptableInput():
+            with QSignalBlocker(self.seconds):
+                self.seconds.setText(self.seconds.text().zfill(2))
 
 
 class DistanceInput(ChoiceBox):
@@ -245,15 +338,11 @@ class DistanceInput(ChoiceBox):
         self.setFixedWidth(105)
         self.setMaxVisibleItems(6)
         self.addItems([str(value) for value in range(1, 21)])
-        validator = QDoubleValidator(0, 1000, 6, self)
-        validator.setNotation(QDoubleValidator.StandardNotation)
-        locale = QLocale.c()
-        locale.setNumberOptions(QLocale.RejectGroupSeparator)
-        validator.setLocale(locale)
+        validator = QRegularExpressionValidator(QRegularExpression(r"[1-9][0-9]{0,2}|1000"), self)
         self.lineEdit().setValidator(validator)
-        self.lineEdit().setMaxLength(12)
-        self.lineEdit().setPlaceholderText("如 2.5")
+        self.lineEdit().setPlaceholderText("如 10")
         self.lineEdit().setAlignment(Qt.AlignCenter)
+
 
 class RoutePreview(QWidget):
     """Draw simulated playback progress, not an inferred live phone GPS position."""

@@ -12,21 +12,24 @@ import pytest
 
 from ios17_helper import main as helper
 from vrun.device import Cancelled, Device, DeviceBackend, DeviceError
-from vrun.modern import ModernBackend
+from vrun.modern import DeviceConnectionError, ModernBackend
 from vrun.routes import Point
 from tests.test_device import probe_output
 
 DEVICE = Device("same-device", "Test iPhone", "17.6")
 
 
-def test_helper_failure_summary_preserves_coded_error():
+@pytest.mark.parametrize("restoring, button", [(False, "开始"), (True, "结束并恢复真实定位")])
+def test_helper_failure_summary_keeps_action_and_code_without_internal_details(restoring, button):
     backend = ModernBackend()
-    backend.responses.put({"id": 0, "ok": False, "error": "请先解锁 iPhone。",
-                           "error_type": "OSError", "detail": "locked",
+    backend.responses.put({"id": 0, "ok": False, "error": "请先解锁 iPhone，再点击「开始」。",
+                           "error_type": "SetupHint", "detail": "Internal USB failure",
                            "codes": {"winerror": 1167}})
     with pytest.raises(DeviceError, match=r"(?i)winerror 1167") as error:
-        backend._receive(0, 1)
-    assert "OSError" in str(error.value)
+        backend._receive(0, 1, restoring=restoring)
+    assert f"「{button}」" in str(error.value)
+    assert "SetupHint" not in str(error.value)
+    assert "Internal USB failure" not in str(error.value)
 
 
 @pytest.mark.parametrize("version", ["17.0", "17.3.1", "17.4", "18.7", "26.0"])
@@ -90,6 +93,38 @@ def test_helper_transport_round_trip_and_clean_shutdown(monkeypatch, tmp_path):
     assert backend.log_file is None
 
 
+@pytest.mark.parametrize("second_connection_works", [True, False])
+def test_reset_reconnects_once_on_a_closed_dtx_channel(monkeypatch, tmp_path, second_connection_works):
+    script = tmp_path / "fake_helper.py"
+    script.write_text(
+        'import json, sys\n'
+        'from pathlib import Path\n'
+        'log = Path(__file__).with_suffix(".requests")\n'
+        'with log.open("a+") as calls:\n'
+        ' calls.seek(0)\n'
+        ' reconnect = bool(calls.read())\n'
+        ' print(json.dumps({"id": 0, "ok": True}), flush=True)\n'
+        ' for line in sys.stdin:\n'
+        '  request = json.loads(line)\n'
+        '  calls.write(sys.argv[2] + ":" + request["op"] + "\\n")\n'
+        '  calls.flush()\n'
+        f'  response = {{"id": request["id"], "ok": reconnect and {second_connection_works!r}}}\n'
+        '  if not response["ok"]:\n'
+        '   response.update(error="设备连接已中断。", error_type="ConnectionTerminatedError")\n'
+        '  print(json.dumps(response), flush=True)\n', encoding="utf-8")
+    monkeypatch.setattr("vrun.modern.helper_command", lambda: [sys.executable, str(script)])
+    monkeypatch.setattr("vrun.modern.data_dir", lambda: tmp_path)
+    backend = ModernBackend()
+    backend.prepare(DEVICE, threading.Event(), lambda _: None)
+    if second_connection_works:
+        backend.reset(DEVICE)
+    else:
+        with pytest.raises(DeviceConnectionError, match="连接已中断"):
+            backend.reset(DEVICE)
+    assert script.with_suffix(".requests").read_text().splitlines() == [f"{DEVICE.udid}:clear"] * 2
+    assert backend.process is None and backend.log_file is None
+
+
 def test_setup_cancel_reaps_helper(monkeypatch, tmp_path):
     script = tmp_path / "fake_helper.py"
     script.write_text("import sys\nfor line in sys.stdin: pass\n", encoding="utf-8")
@@ -128,7 +163,7 @@ def test_cancelled_update_sends_nothing_and_mismatched_device_is_rejected():
     cancel.set()
     with pytest.raises(Cancelled):
         backend.set_location(DEVICE, Point(30, 120), cancel)
-    with pytest.raises(DeviceError, match="标识"):
+    with pytest.raises(DeviceError, match="连接的设备已变化"):
         backend.set_location(DEVICE, Point(30, 120), threading.Event())
 
 
@@ -138,10 +173,17 @@ def test_early_version_boundary(version, expected):
     assert helper.early_ios17(version) is expected
 
 
-def test_helper_restores_before_closing_tunnel_even_when_set_fails():
+def test_helper_restores_before_closing_tunnel_even_when_set_fails(monkeypatch):
+    events = []
+
+    async def keep_channel_open(seconds):
+        assert seconds > 0
+        events.append("grace")
+
+    monkeypatch.setattr(helper.asyncio, "sleep", keep_channel_open)
+
     async def scenario():
         session = helper.Session(DEVICE.udid)
-        events = []
         class Location:
             async def set(self, *args):
                 events.append("set")
@@ -155,7 +197,7 @@ def test_helper_restores_before_closing_tunnel_even_when_set_fails():
         with pytest.raises(OSError):
             await session.set(30, 120)
         await session.close()
-        assert events == ["set", "clear", "close"]
+        assert events == ["set", "clear", "grace", "close"]
     asyncio.run(scenario())
 
 

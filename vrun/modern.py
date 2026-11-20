@@ -10,18 +10,24 @@ import sys
 import threading
 import time
 
-from .device import Cancelled, DeviceError
+from .device import END_ACTION, Cancelled, DeviceError
 from .diagnostics import error_summary
 from .paths import data_dir, resource_dir
 
 LOG = logging.getLogger(__name__)
+TRANSPORT_ERRORS = {"BrokenPipeError", "ConnectionAbortedError", "ConnectionResetError",
+                    "ConnectionTerminatedError", "IncompleteReadError", "TimeoutError"}
+
+
+class DeviceConnectionError(DeviceError):
+    pass
 
 
 def helper_command():
     if getattr(sys, "frozen", False):
         executable = resource_dir() / "ios17" / "IRun-iOS17.exe"
         if not executable.is_file():
-            raise DeviceError("iOS 17+ 组件缺失，请重新安装 IRun。")
+            raise DeviceError("IRun 的设备连接组件缺失。请重新运行 IRun 安装包。")
         return [str(executable)]
     return [sys.executable, str(Path(__file__).resolve().parents[1] / "ios17_helper" / "main.py")]
 
@@ -44,22 +50,22 @@ class ModernBackend:
         finally:
             responses.put(None)
 
-    def _receive(self, identifier, timeout, cancel=None, status=None):
+    def _receive(self, identifier, timeout, cancel=None, status=None, restoring=False):
         deadline = time.monotonic() + timeout
         while True:
             if cancel and cancel.is_set():
                 raise Cancelled()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise DeviceError("iOS 17+ 设备响应超时，请检查手机、USB 和网络连接。")
+                raise DeviceConnectionError("设备响应超时。请保持 iPhone 或 iPad 解锁，重新插拔 USB 线后重试。")
             try:
                 response = self.responses.get(timeout=min(remaining, 0.1))
             except queue.Empty:
                 continue
             if response is None:
                 code = self.process.poll() if self.process is not None else None
-                suffix = f"（组件退出码 {code}）" if code is not None else ""
-                raise DeviceError("iOS 17+ 连接已中断。请保持同一台手机连接后重试。" + suffix)
+                suffix = f"（退出码 {code}）" if code is not None else ""
+                raise DeviceConnectionError("设备连接已中断。请重新连接同一台 iPhone 或 iPad 后重试。" + suffix)
             if not isinstance(response, dict):
                 continue
             if response.get("event") == "status":
@@ -69,21 +75,21 @@ class ModernBackend:
             if response.get("id") != identifier:
                 continue
             if not response.get("ok"):
-                message = str(response.get("error", "iOS 17+ 通信失败。"))
-                category = response.get("error_type")
+                message = str(response.get("error", "设备通信失败。请点击「导出诊断日志」。"))
+                if restoring:
+                    message = message.replace("「开始」", f"「{END_ACTION}」")
                 codes = response.get("codes")
-                if isinstance(category, str) and category not in message:
-                    message += f"（{category}）"
                 detail = str(response.get("detail", ""))
                 if isinstance(codes, dict):
                     detail += "\n" + " ".join(f"{key} {value}" for key, value in codes.items())
-                raise DeviceError(error_summary(message, detail, private_values=(self.udid,)))
+                error_class = DeviceConnectionError if response.get("error_type") in TRANSPORT_ERRORS else DeviceError
+                raise error_class(error_summary(message, detail, private_values=(self.udid,)))
             return response
 
-    def open(self, device, cancel=None, status=lambda text: None):
+    def open(self, device, cancel=None, status=lambda text: None, *, restoring=False):
         if self.process is not None:
             if self.udid != device.udid:
-                raise DeviceError("恢复定位前不能切换到另一台手机。")
+                raise DeviceError("请连接刚才用于模拟的 iPhone 或 iPad，再恢复定位。")
             if self.process.poll() is None:
                 return
             self.close()
@@ -99,22 +105,22 @@ class ModernBackend:
                 env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"},
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             threading.Thread(target=self._read, args=(self.process, self.responses), daemon=True).start()
-            self._receive(0, 300, cancel, status)
+            self._receive(0, 300, cancel, status, restoring=restoring)
         except BaseException:
             self.close()
             raise
 
     def request(self, operation, **values):
         if self.process is None or self.process.poll() is not None:
-            raise DeviceError("iOS 17+ 连接已中断，请重新连接同一台手机。")
+            raise DeviceConnectionError("设备连接已中断。请重新连接同一台 iPhone 或 iPad。")
         self.sequence += 1
         try:
             self.process.stdin.write(json.dumps({"id": self.sequence, "op": operation, **values}) + "\n")
             self.process.stdin.flush()
         except (OSError, ValueError) as error:
-            raise DeviceError("iOS 17+ 连接已中断，请检查 USB。") from error
+            raise DeviceConnectionError("设备连接已中断。请检查 USB 线是否插牢。") from error
         # Once a coordinate is sent, wait for its bounded acknowledgement before clearing.
-        return self._receive(self.sequence, 15)
+        return self._receive(self.sequence, 15, restoring=operation == "clear")
 
     def prepare(self, device, cancel, status):
         self.open(device, cancel, status)
@@ -124,17 +130,26 @@ class ModernBackend:
         if cancel.is_set():
             raise Cancelled()
         if self.udid != device.udid:
-            raise DeviceError("设备标识不匹配，已停止发送定位。")
+            raise DeviceError("连接的设备已变化，已停止发送定位。请重新连接原来的 iPhone 或 iPad。")
         self.request("set", lat=point.lat, lng=point.lng)
 
     def reset(self, device):
         try:
-            started = time.monotonic()
-            self.open(device)
-            LOG.info("Location reset transport ready after %.2f s", time.monotonic() - started)
-            started = time.monotonic()
-            self.request("clear")
-            LOG.info("Stop simulation sent by helper after %.2f s", time.monotonic() - started)
+            for attempt in range(2):
+                started = time.monotonic()
+                self.open(device, restoring=True)
+                LOG.info("Location reset transport ready after %.2f s", time.monotonic() - started)
+                started = time.monotonic()
+                try:
+                    self.request("clear")
+                except DeviceConnectionError:
+                    if attempt:
+                        raise
+                    LOG.warning("Location reset lost its connection; reopening it once", exc_info=True)
+                    self.close()
+                else:
+                    LOG.info("Stop simulation sent by helper after %.2f s", time.monotonic() - started)
+                    return
         finally:
             started = time.monotonic()
             self.close()

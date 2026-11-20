@@ -2,21 +2,20 @@
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QPushButton, QVBoxLayout)
 
 from .map_preview import MapRoutePreview
 from .route_library import load_saved_route
-from .routes import load_route
-from .widgets import ChoiceBox
+from .routes import load_route, route_kind
+from .widgets import ChoiceBox, MapDialog
 
 
-class RouteManagerDialog(QDialog):
+class RouteManagerDialog(MapDialog):
     def __init__(self, colors, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, 1060, 740)
         self.setWindowTitle("路线管理")
         self.setObjectName("routeManager")
-        self.resize(720, 475)
         self.entries = []
         layout = QVBoxLayout(self)
         filters = QHBoxLayout()
@@ -27,8 +26,8 @@ class RouteManagerDialog(QDialog):
         self.kind_filter = ChoiceBox()
         self.kind_filter.set_popup_colors(colors)
         self.kind_filter.addItem("全部类型", None)
-        self.kind_filter.addItem("闭合环线", True)
-        self.kind_filter.addItem("非闭合 · 往返", False)
+        self.kind_filter.addItem(route_kind(True), True)
+        self.kind_filter.addItem(route_kind(False), False)
         filters.addWidget(self.kind_filter)
         layout.addLayout(filters)
 
@@ -53,7 +52,7 @@ class RouteManagerDialog(QDialog):
 
         actions = QHBoxLayout()
         self.import_button = self._button(actions, "导入…")
-        self.draw_button = self._button(actions, "绘制…")
+        self.new_button = self._button(actions, "新建…")
         self.edit_button = self._button(actions, "编辑…")
         self.rename_button = self._button(actions, "重命名…")
         self.copy_button = self._button(actions, "复制")
@@ -102,7 +101,7 @@ class RouteManagerDialog(QDialog):
         for name, path, closed in self.entries:
             if query not in name.casefold() or kind is not None and kind != closed:
                 continue
-            item = QListWidgetItem(f"{name}  ·  {'闭合环线' if closed else '非闭合往返'}")
+            item = QListWidgetItem(f"{name}  ·  {route_kind(closed)}")
             item.setToolTip(name)
             item.setData(Qt.UserRole, path)
             self.routes.addItem(item)

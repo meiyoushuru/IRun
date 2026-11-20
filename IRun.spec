@@ -31,7 +31,7 @@ a = Analysis(
         *[(str(path), "libimobiledevice/win") for path in (root / "libimobiledevice" / "win").iterdir()
           if path.suffix == ".dll" or path.name == "ideviceinfo.exe"],
         *[(str(root / "assets" / name), "assets") for name in (
-            "check-dark.svg", "check-light.svg", "chevron-dark.svg", "chevron-light.svg", "irun.ico", "irun.png"
+            "check-ink.svg", "check-white.svg", "chevron.svg", "irun.ico", "irun.png"
         )],
     ],
     hiddenimports=["winotify"],

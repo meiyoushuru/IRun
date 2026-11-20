@@ -47,10 +47,6 @@ def error_summary(message, detail="", *, private_values=()):
     missing = [code for code in codes if code not in summary]
     if missing:
         summary += "（" + "，".join(missing[:4]) + "）"
-    first_detail = next((line.strip() for line in detail.splitlines() if line.strip()), "")
-    if first_detail and first_detail.casefold() not in message.casefold() and len(summary) < 200:
-        excerpt = first_detail if len(first_detail) <= 95 else first_detail[:92] + "…"
-        summary += " · " + excerpt
     return summary
 
 

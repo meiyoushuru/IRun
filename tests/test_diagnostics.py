@@ -53,9 +53,9 @@ def test_diagnostic_export_button_saves_current_error_and_log_tail(window, tmp_p
     assert "暂无日志文件" in result
 
 
-def test_error_summary_keeps_codes_after_the_excerpt():
+def test_error_summary_keeps_codes_without_raw_details():
     detail = "First line\n" + "diagnostic context " * 40 + "\n[E001005] SavePairRecord 183"
     summary = error_summary("设备通信失败。", detail)
-    assert "First line" in summary
+    assert "First line" not in summary
     assert "E001005" in summary and "SavePairRecord 183" in summary
     assert "diagnostic context" not in summary

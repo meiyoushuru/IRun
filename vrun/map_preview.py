@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MPL-2.0
 """Non-interactive route previews over a fitted OpenStreetMap basemap."""
-import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainterPath, QPen
 from PySide6.QtWidgets import QLabel
 
-from .map_tiles import MapTiles
+from .map_tiles import MapTiles, TILE_SIZE, tile_zoom, visible_tiles
 from .offline_maps import OSM_ATTRIBUTION
 from .paths import local_data_root
-from .route_map import TILE_SIZE, project, visible_tiles
+from .route_map import fitted_zoom, project_route, projected_bounds
 from .widgets import RoutePreview
 
 
@@ -33,8 +32,11 @@ class MapRoutePreview(RoutePreview):
         label.setObjectName("muted")
         label.setOpenExternalLinks(True)
         label.setToolTip(name)
-        label.setVisible(bool(self.tiles.images))
-        self.tiles.changed.connect(lambda: label.setVisible(bool(self.tiles.images)))
+        policy = label.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        label.setSizePolicy(policy)
+        label.setVisible(self.tiles.has_basemap)
+        self.tiles.changed.connect(lambda: label.setVisible(self.tiles.has_basemap))
         return label
 
     def _tiles_changed(self):
@@ -46,14 +48,7 @@ class MapRoutePreview(RoutePreview):
 
     def set_route(self, route, **kwargs):
         super().set_route(route, **kwargs)
-        self._projected = []
-        if route is not None:
-            preceding_x = project(route.points[0]).x()
-            for point in route.points:
-                projected = project(point)
-                projected.setX(projected.x() + round(preceding_x - projected.x()))
-                self._projected.append(projected)
-                preceding_x = projected.x()
+        self._projected = project_route(route.points) if route is not None else []
         self._fit_view()
 
     def _fit_view(self):
@@ -62,17 +57,11 @@ class MapRoutePreview(RoutePreview):
             self._tile_timer.stop()
             self.tiles.show_tiles(set())
             return
-        left = min(point.x() for point in self._projected)
-        right = max(point.x() for point in self._projected)
-        top = min(point.y() for point in self._projected)
-        bottom = max(point.y() for point in self._projected)
-        scale = max((right - left) / max(1, self.width() - 48),
-                    (bottom - top) / max(1, self.height() - 44), 1 / (TILE_SIZE * 2 ** 19))
-        world = 1 / scale
-        zoom = max(0, min(19, round(math.log2(world / TILE_SIZE))))
-        origin = QPointF((left + right) * world / 2 - self.width() / 2,
-                         (top + bottom) * world / 2 - self.height() / 2)
-        self._view = world, zoom, origin
+        bounds = projected_bounds(self._projected)
+        zoom = fitted_zoom(bounds, self.width() - 48, self.height() - 44)
+        world = TILE_SIZE * 2 ** zoom
+        origin = bounds.center() * world - QPointF(self.width() / 2, self.height() / 2)
+        self._view = world, tile_zoom(zoom), origin
         if self.isVisible():
             self._tile_timer.start()
         self.update()
@@ -103,10 +92,7 @@ class MapRoutePreview(RoutePreview):
         clip = QPainterPath()
         clip.addRoundedRect(QRectF(self.rect()), 9, 9)
         painter.setClipPath(clip)
-        for key, target in self._visible_tiles():
-            image = self.tiles.images.get(key)
-            if image is not None:
-                painter.drawPixmap(target, image, QRectF(image.rect()))
+        self.tiles.paint(painter, origin, self.width(), self.height(), world)
         return [point * world - origin for point in self._projected]
 
     def _paint_track(self, painter, full):

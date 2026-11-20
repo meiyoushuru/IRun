@@ -15,7 +15,8 @@ from .paths import resource_dir
 from .routes import Point
 
 LOG = logging.getLogger(__name__)
-NO_DEVICE = "未找到设备。请检查 USB 连接并解锁设备。"
+NO_DEVICE = "未找到设备。请通过 USB 连接设备并解锁。"
+END_ACTION = "结束并恢复真实定位"
 
 class DeviceError(RuntimeError):
     pass
@@ -55,12 +56,10 @@ def friendly_error(text: str) -> str:
     if "no device" in lower or "no idevice" in lower:
         return NO_DEVICE
     if "passcode" in lower or "password" in lower or "locked" in lower:
-        return "请先解锁 iPhone，再点击开始。"
+        return "请先解锁 iPhone 或 iPad。"
     if "trust" in lower or "pairingdialog" in lower or "userdenied" in lower:
-        return "请在 iPhone 上选择“信任此电脑”，完成后再次点击开始。"
-    if "developer" in lower:
-        return "请检查手机的开发者模式和开发者镜像，然后重试。"
-    return "设备通信失败。"
+        return "请解锁 iPhone 或 iPad。如果设备弹出「信任此电脑」，请点「信任」。"
+    return "无法读取设备信息。请解锁设备并重新插拔 USB 线。如果仍失败，请点击「导出诊断日志」。"
 
 
 class DeviceBackend:
@@ -74,21 +73,22 @@ class DeviceBackend:
                 cancel: threading.Event | None = None) -> str:
         executable = self.tools / (tool + ".exe")
         if not executable.is_file():
-            raise DeviceError("设备工具缺失，请重新安装 IRun。")
+            raise DeviceError("IRun 的设备连接组件缺失。请重新运行 IRun 安装包。")
         if cancel and cancel.is_set():
             raise Cancelled()
         try:
             process = subprocess.Popen([str(executable), *map(str, args)], stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as error:
-            raise DeviceError(error_summary("无法启动设备工具，请检查 IRun 安装。", str(error))) from error
+            LOG.exception("Unable to start %s", tool)
+            raise DeviceError(error_summary("无法启动 IRun 的设备连接组件。请重新运行安装包。", str(error))) from error
         deadline = time.monotonic() + timeout
         try:
             while True:
                 if cancel and cancel.is_set():
                     raise Cancelled()
                 if time.monotonic() > deadline:
-                    raise DeviceError("设备响应超时，请检查手机是否解锁及 USB 连接。")
+                    raise DeviceError("设备响应超时。请解锁设备并重新插拔 USB 线。")
                 try:
                     stdout, stderr = process.communicate(timeout=0.15)
                     break
@@ -108,7 +108,7 @@ class DeviceBackend:
             LOG.warning("%s failed (exit %s). stdout=%r stderr=%r", tool, process.returncode,
                         output[:4096], errors[:4096])
             if process.returncode:
-                hint += f"（{tool} 退出码 {process.returncode}）"
+                hint += f"（退出码 {process.returncode}）"
             raise DeviceError(error_summary(hint, detail))
         return output
 
@@ -127,11 +127,12 @@ class DeviceBackend:
             device = Device(data["UniqueDeviceID"], data.get("DeviceName", default_name),
                             data["ProductVersion"], product_type)
         except (ValueError, KeyError, plistlib.InvalidFileException) as error:
-            raise DeviceError("无法读取手机信息，请解锁手机并确认信任此电脑。") from error
+            LOG.warning("Could not read device information", exc_info=True)
+            raise DeviceError("无法读取设备信息。请解锁设备，如弹出「信任此电脑」，请点「信任」。") from error
         return device
 
     def prepare(self, cancel: threading.Event, status) -> Device:
-        status("正在检查手机，请保持 iPhone 解锁…")
+        status("正在识别通过 USB 连接的设备，请保持设备解锁并稍候…")
         device = self.probe(cancel)
         device.require_supported()
         return self._modern_backend().prepare(device, cancel, status)

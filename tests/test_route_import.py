@@ -7,7 +7,8 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
 
 from vrun.app import Window
 from vrun.import_dialog import ImportRouteDialog
-from vrun.route_library import load_gpx, load_saved_route, read_saved_route, save_loop, save_route
+from vrun.manage_dialog import RouteManagerDialog
+from vrun.route_library import export_gpx, load_gpx, load_saved_route, read_saved_route, save_loop, save_route
 from vrun.routes import Point, build_loop, build_route
 from tests.test_speed import run_timed
 
@@ -75,6 +76,14 @@ def test_route_interpolates_across_antimeridian():
     assert abs(midpoint.lng) == pytest.approx(180)
 
 
+def test_invalid_xml_character_in_route_name_cannot_corrupt_gpx(tmp_path, sample_route):
+    exported = tmp_path / "route.gpx"
+    export_gpx(exported, "路线", sample_route.points)
+    with pytest.raises(ValueError, match="路线名称"):
+        export_gpx(exported, "路线\x01", sample_route.points)
+    assert load_gpx(exported)[0].name == "路线"
+
+
 @pytest.mark.parametrize("contents, message", [
     ('<gpx version="1.0"/>', "GPX 1.1"),
     ('<gpx', "XML"),
@@ -117,8 +126,17 @@ def test_import_dialog_cancel_or_save_and_restore_selection(application, monkeyp
             if dialog.result() != QDialog.Accepted:
                 dialog.reject()
 
-    QTimer.singleShot(0, interact)
-    window.import_button.click()
+    def import_from_manager():
+        manager = QApplication.activeModalWidget()
+        try:
+            assert isinstance(manager, RouteManagerDialog)
+            QTimer.singleShot(0, interact)
+            manager.import_button.click()
+        finally:
+            manager.reject()
+
+    QTimer.singleShot(0, import_from_manager)
+    window.manage_button.click()
     assert inspected
     assert window.routes.count() == original_count + int(save)
     files = list((tmp_path / "IRun" / "routes").glob("*.json"))
@@ -127,7 +145,7 @@ def test_import_dialog_cancel_or_save_and_restore_selection(application, monkeyp
         assert window.route.points == inspected[0]
         assert window.route.path == files[0]
         assert not window.route.closed
-        assert "非闭合" in window.route_info.text()
+        assert "往返路线" in window.route_info.text()
         assert window.routes.currentText() == "我的公园路线"
     window.close()
     application.processEvents()

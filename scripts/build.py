@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from vrun import WINDOWS_FILE_VERSION, __version__
 from prepare_ddi import prepare as prepare_ddi
-from vrun.offline_maps import OFFLINE_MAP_ASSET
+from vrun.offline_maps import OFFLINE_MAP_ASSET, read_map_views
 
 
 def copy_runtime_notices(target: Path):
@@ -98,14 +98,8 @@ def verify_bundle(target: Path):
 def check_map_pack(path):
     try:
         with zipfile.ZipFile(path) as archive:
-            views = json.loads(archive.read("views.json"))
-            if not isinstance(views, list) or not views:
+            if not read_map_views(archive):
                 raise ValueError("missing preset views")
-            for view in views:
-                if (not isinstance(view, dict) or not isinstance(view.get("name"), str)
-                        or not view["name"].strip() or len(view.get("bounds", [])) != 4
-                        or len(view.get("focus_bounds", view["bounds"])) != 4):
-                    raise ValueError("invalid preset view")
             if not any(re.fullmatch(r"tiles/\d+/\d+/\d+\.png", name) for name in archive.namelist()):
                 raise ValueError("missing tile images")
             if corrupt := archive.testzip():
@@ -123,12 +117,19 @@ def main():
     args = parser.parse_args()
     if bool(args.offline_map_pack) != bool(args.edition):
         parser.error("--offline-map-pack and --edition must be provided together")
+    if subprocess.check_output(["git", "ls-files", "-z", "--", ".local-editions/"], cwd=ROOT):
+        raise SystemExit("Remove local edition files from the public Git index before building.")
     pack = args.offline_map_pack.resolve() if args.offline_map_pack else None
     if pack:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,29}", args.edition):
             parser.error("--edition must contain only ASCII letters, numbers, and hyphens")
         if pack.is_relative_to(ROOT):
-            parser.error("Keep the offline map pack outside the repository")
+            ignored = subprocess.run(
+                ["git", "check-ignore", "--quiet", "--", pack.relative_to(ROOT).as_posix()],
+                cwd=ROOT, capture_output=True,
+            )
+            if ignored.returncode != 0:
+                parser.error("Use an ignored local path or a map pack outside the repository")
         check_map_pack(pack)
     os.chdir(ROOT)
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT).returncode:

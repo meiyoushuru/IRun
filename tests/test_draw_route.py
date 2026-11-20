@@ -8,7 +8,7 @@ import pytest
 
 from PySide6.QtCore import (QBuffer, QCoreApplication, QEvent, QEventLoop, QIODevice, QObject, QPoint, QPointF,
                             QSettings, Qt, QTimer, Signal)
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QWheelEvent
 from PySide6.QtNetwork import QNetworkProxy
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
@@ -43,6 +43,9 @@ class UnavailableTiles(QObject):
         self.failed = keys
         self.changed.emit()
 
+    def paint(self, *args):
+        pass
+
 
 def test_export_gpx_round_trips_precise_coordinates_and_name(tmp_path):
     path = tmp_path / "track.gpx"
@@ -54,12 +57,13 @@ def test_export_gpx_round_trips_precise_coordinates_and_name(tmp_path):
     assert track.points == points
 
 
-def test_draw_drag_undo_close_save_and_export(application, monkeypatch, tmp_path):
+def test_draw_drag_undo_close_save_and_export(application, monkeypatch, tmp_path, sample_route):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setattr("vrun.draw_dialog.MapTiles", UnavailableTiles)
     destinations = iter([tmp_path / "open", tmp_path / "loop.gpx"])
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(next(destinations)), ""))
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    save_route(tmp_path / "IRun" / "routes", "新建路线", sample_route)
     window = Window(settings=settings, poll=False)
     expected = []
 
@@ -67,25 +71,30 @@ def test_draw_drag_undo_close_save_and_export(application, monkeypatch, tmp_path
         dialog = QApplication.activeModalWidget()
         try:
             assert isinstance(dialog, DrawRouteDialog)
+            assert dialog.windowTitle() == dialog.name.text() == "新建路线"
             canvas = dialog.map
             assert canvas.zoom_controls.pos() == QPoint(12, 12)
             assert canvas.scale_bar.y() + canvas.scale_bar.height() + 12 == canvas.height()
             dialog.location.setText("31.221, 121.436")
             dialog.location.returnPressed.emit()
             assert (project(Point(31.221, 121.436)) - canvas.center).manhattanLength() < 1e-9
-            original_zoom, original_scale = canvas.zoom, canvas.scale_bar.label
+            original_zoom, original_scale = canvas.zoom, canvas.scale_bar.pixels
             canvas.zoom_in.click()
-            assert canvas.zoom == original_zoom + 1
-            assert canvas.scale_bar.label != original_scale
+            assert canvas.zoom == original_zoom + 0.25
+            assert canvas.scale_bar.pixels != original_scale
             canvas.zoom_out.click()
             assert canvas.zoom == original_zoom
-            assert canvas.scale_bar.label == original_scale
+            assert canvas.scale_bar.pixels == original_scale
             anchor = QPointF(170, 120)
             start = (canvas.origin + anchor) / canvas.world_size
-            canvas.zoom_by(1, anchor)
+            wheel = QWheelEvent(anchor, QPointF(canvas.mapToGlobal(anchor.toPoint())), QPoint(), QPoint(0, 120),
+                                Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False)
+            QApplication.sendEvent(canvas, wheel)
+            assert canvas.zoom == original_zoom + 0.25
             assert ((canvas.origin + anchor) / canvas.world_size - start).manhattanLength() < 1e-9
             canvas.request_tiles()
-            assert "网络代理" in dialog.map_status.text()
+            assert all(isinstance(zoom, int) for zoom, _, _ in canvas.tiles.failed)
+            assert "「重试底图」" in dialog.map_status.text()
 
             positions = [QPoint(120, 130), QPoint(220, 135), QPoint(210, 240)]
             for position in positions:
@@ -108,9 +117,9 @@ def test_draw_drag_undo_close_save_and_export(application, monkeypatch, tmp_path
             dialog.redo_button.click()
             assert canvas.points[1] != old_point
             dialog.undo_button.click()
-            dialog.name.setText("新绘制的环线")
             dialog.export_button.click()
             track, = load_gpx(tmp_path / "open.gpx")
+            assert track.name == "新建路线"
             assert track.points == tuple(canvas.points)
 
             QTest.mouseClick(canvas, Qt.LeftButton, pos=positions[0])
@@ -124,12 +133,23 @@ def test_draw_drag_undo_close_save_and_export(application, monkeypatch, tmp_path
                 dialog.reject()
 
     QTimer.singleShot(0, interact)
-    window.draw_button.click()
+    window.new_button.click()
     try:
         assert expected
-        assert window.routes.currentText() == "新绘制的环线"
+        assert window.routes.currentText() == "新建路线 (2)"
+        assert "路线名称重复" in window.message.text()
         assert window.route.points == expected[0]
-        window.export_button.click()
+        def export_from_manager():
+            manager = QApplication.activeModalWidget()
+            try:
+                assert isinstance(manager, RouteManagerDialog)
+                assert manager.new_button.text() == "新建…"
+                manager.export_button.click()
+            finally:
+                manager.reject()
+
+        QTimer.singleShot(0, export_from_manager)
+        window.manage_button.click()
         track, = load_gpx(tmp_path / "loop.gpx")
         assert track.points == expected[0]
         assert track.points[0] == track.points[-1]
@@ -203,7 +223,7 @@ def test_main_map_preview_fits_route_and_uses_offline_tiles(application, tmp_pat
     from vrun import theme
 
     preview = MapRoutePreview(tmp_path / "cache")
-    preview.colors = theme.colors("light")
+    preview.colors = theme.colors()
     preview.resize(380, 200)
     points = (Point(0.001, 0.001), Point(0.002, 0.002))
     preview.set_route(build_route(tmp_path / "demo.gpx", points, closed=False))
@@ -231,7 +251,7 @@ def test_route_dialog_displays_basemap(application, tmp_path, monkeypatch, bundl
     from vrun import theme
 
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    colors = theme.colors("light")
+    colors = theme.colors()
     path = tmp_path / "preview.gpx"
     points = (Point(0.001, 0.001), Point(0.002, 0.002), Point(0.001, 0.002))
     if manage:
@@ -264,7 +284,7 @@ def test_closed_route_preserves_the_basemap_inside_the_outline(application, tmp_
     from vrun import theme
 
     preview = MapRoutePreview(tmp_path / "cache")
-    preview.colors = theme.colors("light")
+    preview.colors = theme.colors()
     preview.resize(380, 200)
     preview.set_route(build_route(tmp_path / "ring.gpx", (
         Point(0.001, 0.001), Point(0.002, 0.001),
@@ -282,6 +302,50 @@ def test_closed_route_preserves_the_basemap_inside_the_outline(application, tmp_
     finally:
         preview.deleteLater()
         QCoreApplication.sendPostedEvents(preview, QEvent.DeferredDelete)
+
+
+def test_manager_keeps_basemap_and_campus_overlay_across_zoom_changes(application, tmp_path, bundled_maps):
+    from PySide6.QtGui import QColor
+    from vrun import theme
+
+    tint = QColor("#5ba949")
+    center = project(Point(0.0265, 0.0265))
+    image = QImage(256, 256, QImage.Format_ARGB32)
+    image.fill(tint)
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    assert image.save(buffer, "PNG")
+    with ZipFile(tmp_path / OFFLINE_MAP_ASSET, "a") as archive:
+        for zoom in range(13, 20):
+            x, y = int(center.x() * 2 ** zoom), int(center.y() * 2 ** zoom)
+            archive.writestr(f"overlays/{zoom}/{x}/{y}.png", bytes(buffer.data()))
+
+    path = tmp_path / "demo.gpx"
+    route = build_route(path, (Point(0.019, 0.019), Point(0.034, 0.019),
+                               Point(0.034, 0.034), Point(0.019, 0.034)), closed=True)
+    saved = str(save_route(tmp_path / "routes", "缩放测试", route))
+    dialog = RouteManagerDialog(theme.colors())
+    dialog.resize(1050, 850)
+    dialog.set_entries([("缩放测试", saved, True)], saved)
+    dialog.show()
+    application.processEvents()
+    try:
+        preview = dialog.preview
+        preview._request_tiles()
+        old_zoom = preview._view[1]
+        assert old_zoom >= 16
+        assert preview.grab().toImage().pixelColor(preview.rect().center()) == tint
+        dialog.resize(620, 300)
+        application.processEvents()
+        assert 13 <= preview._view[1] < 16
+        assert preview.grab().toImage().pixelColor(preview.rect().center()) == tint
+        preview._request_tiles()
+        assert preview.grab().toImage().pixelColor(preview.rect().center()) == tint
+        assert {zoom for zoom, _, _ in preview.tiles.overlays} == {preview._view[1]}
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QCoreApplication.sendPostedEvents(dialog, QEvent.DeferredDelete)
 
 
 def test_missing_detailed_tile_uses_the_correct_quadrant_of_an_offline_parent(application, tmp_path):
@@ -302,6 +366,26 @@ def test_missing_detailed_tile_uses_the_correct_quadrant_of_an_offline_parent(ap
     images = offline.load({(16, 5, 7), (18, 23, 31)})
     assert images.keys() == {(16, 5, 7)}
     assert images[(16, 5, 7)].toImage().pixelColor(128, 128) == QColor("#5ba949")
+
+
+def test_invalid_offline_bounds_leave_the_online_map_available(tmp_path):
+    pack = tmp_path / "offline.zip"
+    with ZipFile(pack, "w") as archive:
+        archive.writestr("views.json", '[{"name":"Example","bounds":["west",0,1,1]}]')
+        archive.writestr("tiles/16/5/7.png", b"")
+    offline = OfflineMaps(pack)
+    assert not offline.views and not offline.names
+
+
+def test_open_map_tolerates_removed_tiles_after_its_archive_is_replaced(tmp_path):
+    pack = tmp_path / "offline.zip"
+    with ZipFile(pack, "w") as archive:
+        archive.writestr("views.json", "[]")
+        archive.writestr("tiles/16/5/7.png", b"")
+    offline = OfflineMaps(pack)
+    with ZipFile(pack, "w") as archive:
+        archive.writestr("views.json", "[]")
+    assert offline.load({(16, 5, 7)}) == {}
 
 
 def test_map_tile_download_and_cache(application, tmp_path):
@@ -336,15 +420,19 @@ def test_map_tile_download_and_cache(application, tmp_path):
             timeout.setSingleShot(True)
             timeout.timeout.connect(loop.quit)
             key = (16, 54628, 26973)
-            for _ in range(2):
+            for index, requested in enumerate((key, key, (17, 109256, 53946))):
                 timeout.start(3000)
-                tiles.show_tiles({key})
+                tiles.show_tiles({requested})
                 if tiles.pending:
+                    if requested != key:
+                        assert key in tiles._previous_images
                     loop.exec()
                 timeout.stop()
-                assert tiles.images[key].width() == 256
-                tiles.show_tiles(set())
-            assert len(requests) == 1
+                assert tiles.images[requested].width() == 256
+                assert not tiles._previous_images
+                if index == 0:
+                    tiles.show_tiles(set())
+            assert len(requests) == 2
             assert requests[0][0] == "/16/54628/26973.png"
             assert requests[0][1].startswith("IRun/")
         finally:
@@ -360,7 +448,7 @@ def test_new_route_defaults_to_first_preset_and_restores_the_last(application, t
 
     def open_draw(width, height):
         settings = QSettings(settings_path, QSettings.IniFormat)
-        dialog = DrawRouteDialog(tmp_path, None, theme.colors("light"), settings=settings)
+        dialog = DrawRouteDialog(tmp_path, None, theme.colors(), settings=settings)
         dialog.resize(width, height)
         dialog.show()
         application.processEvents()
@@ -368,10 +456,13 @@ def test_new_route_defaults_to_first_preset_and_restores_the_last(application, t
 
     def assert_preset_fits(dialog):
         west, south, east, north = dialog.preset_choice.currentData()["focus_bounds"]
-        for point in (Point(north, west), Point(south, east)):
-            pixel = project(point) * dialog.map.world_size - dialog.map.origin
+        pixels = [project(point) * dialog.map.world_size - dialog.map.origin
+                  for point in (Point(north, west), Point(south, east))]
+        for pixel in pixels:
             assert 0 <= pixel.x() <= dialog.map.width()
             assert 0 <= pixel.y() <= dialog.map.height()
+        span = pixels[1] - pixels[0]
+        assert min(dialog.map.width() - span.x(), dialog.map.height() - span.y()) == pytest.approx(16)
 
     dialog = open_draw(850, 650)
     assert dialog.preset_choice.currentText() == "测试地点 A"
@@ -382,6 +473,10 @@ def test_new_route_defaults_to_first_preset_and_restores_the_last(application, t
     assert dialog.settings.value(PRESET_SETTING) == "测试地点 B"
     assert_preset_fits(dialog)
     small_zoom = dialog.map.zoom
+    dialog.resize(1080, 900)
+    application.processEvents()
+    assert dialog.map.zoom > small_zoom
+    assert_preset_fits(dialog)
     dialog.close()
     dialog.deleteLater()
     QCoreApplication.sendPostedEvents(dialog, QEvent.DeferredDelete)
@@ -404,7 +499,7 @@ def test_public_draw_dialog_has_no_preset_picker(application, tmp_path, monkeypa
     monkeypatch.setattr(MapTiles, "show_tiles", lambda *_: None)
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
     settings.setValue(PRESET_SETTING, "测试地点 A")
-    dialog = DrawRouteDialog(tmp_path, None, theme.colors("light"), settings=settings)
+    dialog = DrawRouteDialog(tmp_path, None, theme.colors(), settings=settings)
     try:
         dialog.show()
         application.processEvents()

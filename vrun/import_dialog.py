@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: MPL-2.0
 from PySide6.QtCore import QSignalBlocker, Qt
-from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout
+from PySide6.QtWidgets import QCheckBox, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout
 
 from .map_preview import MapRoutePreview
 from .route_library import MAX_ROUTE_NAME_LENGTH
 from .routes import build_route
-from .widgets import ChoiceBox
+from .widgets import ChoiceBox, MapDialog
 
 
-class ImportRouteDialog(QDialog):
+class ImportRouteDialog(MapDialog):
     def __init__(self, path, segments, colors, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, 980, 700)
         self.path = path
         self.segments = segments
         self.route = None
         self.setWindowTitle("导入 GPX 路线")
-        self.resize(520, 340)
         layout = QVBoxLayout(self)
         self.segment_choice = ChoiceBox(self)
         self.segment_choice.set_popup_colors(colors)

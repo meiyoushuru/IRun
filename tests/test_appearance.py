@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: MPL-2.0
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QColor, QPalette, QWheelEvent
+from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+from PySide6.QtGui import QColor, QWheelEvent
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QLabel, QWidget
 import pytest
 from vrun import theme
+from vrun.app import Window
 from vrun.device import Device
+from vrun.manage_dialog import RouteManagerDialog
 from tests.test_ui import window
 
 
@@ -15,31 +18,26 @@ def wheel(widget):
     QApplication.sendEvent(widget, event)
 
 
-@pytest.mark.parametrize("mode", ["light", "dark"])
 @pytest.mark.parametrize("accent", ["#000000", "#ffffff", "#ffdd00", "#0078d4"])
-def test_system_accent_remains_readable(mode, accent, application):
-    palette = theme.colors(mode, accent=accent)
+def test_system_accent_remains_readable(accent, application):
+    palette = theme.colors(accent=accent)
     assert theme.contrast(QColor(palette["ink"]), QColor(palette["surface"])) >= 4.5
     assert theme.contrast(QColor(palette["accent_text"]), QColor(palette["accent"])) >= 4.5
 
 
-def test_theme_tracks_system_and_manual_choice_persists(window, monkeypatch, application):
-    state = {"dark": False, "accent": "#0078d4"}
-    monkeypatch.setattr(theme, "system_dark", lambda: state["dark"])
-    monkeypatch.setattr(theme, "windows_accent", lambda: QColor(state["accent"]))
-    window.theme_choice.setCurrentIndex(window.theme_choice.findData("system"))
-    window.apply_theme()
-    assert window.palette_colors["dark"] is False
-    state["dark"] = True
-    application.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
-    assert window.palette_colors["dark"] is True
-    state["accent"] = "#008080"
-    application.paletteChanged.emit(QPalette())
-    assert window.palette_colors["accent"] == "#008080"
-    window.theme_choice.setCurrentIndex(window.theme_choice.findData("light"))
-    application.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
-    assert window.palette_colors["dark"] is False
-    assert window.settings.value("theme") == "light"
+def test_legacy_dark_preference_still_opens_a_light_window(application, monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(theme, "windows_accent", lambda: QColor("#008080"))
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    settings.setValue("theme", "dark")
+    window = Window(settings=settings, poll=False)
+    try:
+        assert window.palette_colors["background"] == theme.LIGHT_COLORS["background"]
+        assert window.palette_colors["accent"] == "#008080"
+        assert window.findChild(QWidget, "themeSelector") is None
+    finally:
+        window.close()
+        application.processEvents()
 
 
 def test_wheel_cannot_change_route_speed_or_target(window):
@@ -54,9 +52,7 @@ def test_wheel_cannot_change_route_speed_or_target(window):
     assert window.target.currentText() == target
 
 
-@pytest.mark.parametrize("mode", ["light", "dark"])
-def test_custom_distance_menu_paints_selected_row_and_preserves_custom_input(window, application, mode):
-    window.theme_choice.setCurrentIndex(window.theme_choice.findData(mode))
+def test_custom_distance_menu_paints_selected_row_and_preserves_custom_input(window, application):
     window.show()
     target = window.target
     target.setEditText("4")
@@ -72,12 +68,30 @@ def test_custom_distance_menu_paints_selected_row_and_preserves_custom_input(win
     QTest.keyClick(view, Qt.Key_Return)
     assert not view.isVisible()
     assert target.currentText() == "20"
-    target.setEditText("2.5")
+    target.setEditText("25")
     target.showPopup()
     assert target.selected_row() == -1
     QTest.keyClick(view, Qt.Key_Escape)
     assert not view.isVisible()
-    assert target.currentText() == "2.5"
+    assert target.currentText() == "25"
+
+
+def test_route_type_menu_fits_all_three_rows_without_scrolling(window, application):
+    window.show()
+    manager = RouteManagerDialog(window.palette_colors, window)
+    manager.show()
+    try:
+        choice = manager.kind_filter
+        choice.showPopup()
+        application.processEvents()
+        view = choice.view()
+        assert view.isVisible()
+        assert choice.count() == 3
+        assert view.verticalScrollBar().maximum() == 0
+        assert view.viewport().rect().contains(view.visualRect(choice.model().index(2, 0)))
+    finally:
+        manager.kind_filter.hidePopup()
+        manager.close()
 
 
 def test_compact_window_places_statistics_above_route_and_removes_help(window, application):
@@ -88,6 +102,9 @@ def test_compact_window_places_statistics_above_route_and_removes_help(window, a
     route_y = window.route_card.mapTo(window, QPoint()).y()
     for item in window.stats_cards:
         assert item.mapTo(window, QPoint()).y() + item.height() <= route_y
+    titles = window.findChildren(QLabel, "sectionHeader")
+    assert {title.text() for title in titles} == {"运动路线", "跑步设置"}
+    assert len({title.mapTo(window, title.rect().center()).y() for title in titles}) == 1
 
 
 def test_running_progress_does_not_inflate_completed_lap_distance(window, application):
@@ -108,7 +125,11 @@ def test_running_progress_does_not_inflate_completed_lap_distance(window, applic
 
 
 def test_incomplete_speed_does_not_start_device_control(window):
+    window._connected(Device("preview", "Test iPhone", "17.6"))
+    assert window.start_button.isEnabled()
     window.speed.setText("")
     window.start()
     assert window.worker is None
-    assert "有效的运动速度或配速" in window.settings_feedback.text()
+    assert window.run_state.text() == "· 未就绪"
+    assert not window.start_button.isEnabled()
+    assert "请输入 0.10–15.00 米/秒" in window.settings_feedback.text()

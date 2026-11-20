@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 import asyncio
 from contextlib import asynccontextmanager
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
@@ -204,9 +205,11 @@ def test_developer_mode_failure_reveals_setting_without_changing_location(api, r
         if reveal_failed:
             api.reveal.side_effect = RuntimeError("AMFI service unavailable")
         session = Session("phone")
-        hint = "Xcode" if reveal_failed else "已请求显示开关"
-        with pytest.raises(SetupHint, match=hint):
+        with pytest.raises(SetupHint, match="请在 iPhone 或 iPad 上打开") as error:
             await session.open()
+        assert "开发者模式未开启" in str(error.value)
+        assert "已请求显示开关" not in str(error.value)
+        assert ("Xcode" in str(error.value)) == reveal_failed
         await session.close()
         api.reveal.assert_awaited_once()
         api.location.set.assert_not_awaited()
@@ -215,7 +218,7 @@ def test_developer_mode_failure_reveals_setting_without_changing_location(api, r
     asyncio.run(scenario())
 
 
-def test_failed_bundled_image_uses_online_then_cached_build(api, tmp_path):
+def test_failed_bundled_image_uses_online_then_cached_build(api, tmp_path, capsys):
     api.mounted = False
     cache = tmp_path / ".pymobiledevice3" / "IRun-DDI" / "Personalized" / "new-build"
     api.download.return_value = cache
@@ -236,9 +239,13 @@ def test_failed_bundled_image_uses_online_then_cached_build(api, tmp_path):
         call(api.rsd, "Personalized", cache),
     ] * 2
     api.download.assert_awaited_once()
+    statuses = [json.loads(line)["message"] for line in capsys.readouterr().out.splitlines()]
+    assert any("通过电脑网络下载开发者镜像" in status for status in statuses)
+    assert any("下载完成，正在将开发者镜像加载到 iPhone 或 iPad" in status for status in statuses)
+    assert any("电脑上已下载的开发者镜像加载到 iPhone 或 iPad" in status for status in statuses)
 
 
-@pytest.mark.parametrize("admin, hint", [(False, "以管理员身份运行"), (True, "IPv6")])
+@pytest.mark.parametrize("admin, hint", [(False, "以管理员身份运行"), (True, "重新插拔 USB 线")])
 def test_early_ios17_failure_has_actionable_hint(api, monkeypatch, admin, hint):
     api.lockdown.product_version = "17.3.1"
     monkeypatch.setattr("ios17_helper.main.windows_admin", lambda: admin)

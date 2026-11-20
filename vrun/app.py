@@ -10,13 +10,13 @@ import sys
 import time
 
 from PySide6.QtCore import QSettings, QSignalBlocker, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                             QInputDialog, QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton,
+from PySide6.QtGui import QFont, QFontDatabase, QIcon, QPixmap
+from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+                             QInputDialog, QMainWindow, QMessageBox, QProgressBar, QPushButton,
                              QScrollArea, QVBoxLayout, QWidget)
 
 from . import __version__, theme
-from .device import Device, DeviceBackend
+from .device import END_ACTION, Device, DeviceBackend
 from .diagnostics import export_report
 from .draw_dialog import DrawRouteDialog, choose_gpx_destination
 from .import_dialog import ImportRouteDialog
@@ -25,12 +25,21 @@ from .map_preview import MapRoutePreview
 from .paths import app_dir, data_dir, local_data_root, resource_dir
 from .route_library import (MAX_ROUTE_NAME_LENGTH, load_gpx, load_saved_route, read_saved_route,
                             rename_route, route_name_key, save_route, unique_route_name)
-from .routes import load_route, pace_text
-from .widgets import ChoiceBox, DistanceInput, PaceInput, SpeedInput
-from .worker import ProbeWorker, RunWorker, RestoreWorker
+from .routes import load_route, pace_text, route_kind
+from .widgets import ChoiceBox, DistanceInput, PaceInput, RunButton, SpeedInput
+from .worker import SETUP_STOPPED, ProbeWorker, RunWorker, RestoreWorker
 
 LOG = logging.getLogger(__name__)
 FORMER_BUILT_IN_ROUTES = {"hnroute.txt", "zjg-west.txt", "zjg-east.txt"}
+DEFAULT_TARGET_KM = 10
+RUN_STATE_LABELS = {
+    "unready": "未就绪",
+    "ready": "已就绪",
+    "loading": "加载中",
+    "running": "运行中",
+    "paused": "已暂停",
+    "restoring": "恢复中",
+}
 
 
 def user_settings():
@@ -70,42 +79,44 @@ class Window(QMainWindow):
         self._closing = self._allow_close = False
         self._run_started = None
         self._paused_at = None
+        self._restoring = self._pause_pending = False
         self._last_restore_failed = False
         self._last_run_error = self._pending_restore = None
         self._last_diagnostic_error = None
-        self._last_restore_device = None
         self._last_seen_device = None
-        self._pending_start = self._applying_theme = False
-        self.palette_colors = {}
+        self._pending_start = False
+        self.palette_colors = theme.colors()
         self.setWindowTitle(f"IRun · 虚拟跑步  {__version__}")
         self.setWindowIcon(QIcon(str(resource_dir() / "assets" / "irun.ico")))
         self.resize(850, 700)
         self.setMinimumSize(760, 600)
         self._create_ui()
+        self.setStyleSheet(theme.stylesheet(self.palette_colors))
         self._load_routes()
         try:
             saved_speed = float(self.settings.value("speed", 3.3))
         except (TypeError, ValueError):
             saved_speed = 3.3
         self._speed_mps = saved_speed if self._valid_speed(saved_speed) else 3.3
-        saved_target = str(self.settings.value("target", "2")).lower().replace("公里", "").replace("km", "").strip()
+        saved_target = str(self.settings.value("target", DEFAULT_TARGET_KM))
+        saved_target = saved_target.lower().removesuffix("公里").removesuffix("km").strip()
         try:
-            self._reminder_m = self._parse_target(saved_target)
+            kilometers = float(saved_target)
+            if not 0 < kilometers <= 1000:
+                raise ValueError
         except ValueError:
-            saved_target, self._reminder_m = "2", 2000.0
-        self.target.setEditText(saved_target)
+            kilometers = DEFAULT_TARGET_KM
+        target_km = max(1, math.floor(kilometers + 0.5))
+        self._reminder_m = target_km * 1000
+        self.target.setCurrentText(str(target_km))
         self.remind.setChecked(str(self.settings.value("remind", "true")).lower() == "true")
         self.target.setEnabled(self.remind.isChecked())
-        self._sync_speed_inputs()
-        self.speed_mode.toggled.connect(self._select_speed_entry)
+        self.speed.setValue(self._speed_mps)
+        self.pace.set_speed(self._speed_mps)
         self.speed.valueChanged.connect(self._speed_changed)
-        self.pace.textChanged.connect(self._pace_changed)
+        self.pace.valueChanged.connect(self._pace_changed)
         self.target.editTextChanged.connect(self._target_changed)
         self.remind.toggled.connect(self._update_reminder)
-        self.theme_choice.currentIndexChanged.connect(self.apply_theme)
-        QApplication.styleHints().colorSchemeChanged.connect(self._system_appearance_changed)
-        QApplication.instance().paletteChanged.connect(self._system_appearance_changed)
-        self.apply_theme()
         self.clock = QTimer(self)
         self.clock.timeout.connect(self._tick)
         self.clock.start(1000)
@@ -136,22 +147,7 @@ class Window(QMainWindow):
             36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         header.addWidget(logo)
         header.addWidget(label("IRun", "brand"))
-        header.addWidget(label("虚拟跑步", "muted"))
         header.addStretch()
-        self.run_state = label("●  未运行", "runState")
-        self.run_state.setProperty("active", False)
-        header.addWidget(self.run_state)
-        header.addSpacing(12)
-        self.theme_choice = ChoiceBox()
-        self.theme_choice.setObjectName("themeSelector")
-        self.theme_choice.setFixedWidth(126)
-        self.theme_choice.setToolTip("外观：跟随 Windows 或手动选择明暗主题")
-        for name, value in (("跟随系统", "system"), ("浅色", "light"), ("深色", "dark")):
-            self.theme_choice.addItem(name, value)
-        preference = str(self.settings.value("theme", "system"))
-        index = self.theme_choice.findData(preference)
-        self.theme_choice.setCurrentIndex(max(0, index))
-        header.addWidget(self.theme_choice)
         page.addLayout(header)
 
         device_card, device_layout = card()
@@ -160,7 +156,7 @@ class Window(QMainWindow):
         details = QVBoxLayout()
         details.setSpacing(2)
         self.device_name = label("连接 iPhone", "section")
-        self.device_hint = label("通过 USB 连接并解锁手机，确认“信任此电脑”。", "muted")
+        self.device_hint = label("通过 USB 连接设备并解锁。如果设备弹出「信任此电脑」，请点「信任」。", "muted")
         self.device_hint.setWordWrap(True)
         details.addWidget(self.device_name)
         details.addWidget(self.device_hint)
@@ -184,13 +180,16 @@ class Window(QMainWindow):
         self.route_card, route_layout = card()
         self.route_card.setMinimumHeight(256)
         route_header = QHBoxLayout()
-        route_header.addWidget(label("运动路线", "section"))
+        route_header.addWidget(label("运动路线", "sectionHeader"))
         route_header.addStretch()
         self.lap_progress = label("本圈 0%", "muted")
         route_header.addWidget(self.lap_progress)
-        self.manage_button = QPushButton("管理路线…")
+        self.manage_button = QPushButton("管理…")
         self.manage_button.clicked.connect(self._manage_routes)
         route_header.addWidget(self.manage_button)
+        self.new_button = QPushButton("新建…")
+        self.new_button.clicked.connect(self._draw_route)
+        route_header.addWidget(self.new_button)
         route_layout.addLayout(route_header)
         self.routes = ChoiceBox()
         self.routes.setObjectName("routeSelector")
@@ -198,18 +197,8 @@ class Window(QMainWindow):
         self.routes.setMinimumContentsLength(12)
         self.routes.currentIndexChanged.connect(self._select_route)
         route_layout.addWidget(self.routes)
-        route_actions = QHBoxLayout()
-        self.import_button = QPushButton("导入路线…")
-        self.import_button.clicked.connect(self._import_route)
-        route_actions.addWidget(self.import_button)
-        self.draw_button = QPushButton("绘制路线…")
-        self.draw_button.clicked.connect(self._draw_route)
-        route_actions.addWidget(self.draw_button)
-        self.export_button = QPushButton("导出 GPX…")
-        self.export_button.clicked.connect(self._export_route)
-        route_actions.addWidget(self.export_button)
-        route_layout.addLayout(route_actions)
         self.preview = MapRoutePreview(parent=self)
+        self.preview.colors = self.palette_colors
         route_layout.addWidget(self.preview, 1)
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("lapProgress")
@@ -229,26 +218,27 @@ class Window(QMainWindow):
         options_card, options = card()
         options_card.setMinimumHeight(256)
         options.setSpacing(6)
-        options.addWidget(label("跑步设置", "section"))
-        speed_modes = QHBoxLayout()
-        self.speed_mode = QRadioButton("编辑运动速度")
-        self.pace_mode = QRadioButton("编辑运动配速")
-        self.speed_mode.setChecked(True)
-        speed_modes.addWidget(self.speed_mode, 1)
-        speed_modes.addWidget(self.pace_mode, 1)
-        options.addLayout(speed_modes)
+        options.addWidget(label("跑步设置", "sectionHeader"))
+        inputs = QGridLayout()
+        inputs.setHorizontalSpacing(10)
+        inputs.setColumnStretch(1, 1)
         speed_row = QHBoxLayout()
-        speed_row.setSpacing(8)
+        speed_row.setSpacing(6)
         self.speed = SpeedInput()
         self.speed.setObjectName("speedInput")
         self.speed.setAccessibleName("运动速度（米每秒）")
-        speed_row.addWidget(self.speed, 1)
+        speed_row.addWidget(self.speed)
+        speed_row.addWidget(label("米/秒", "muted"))
+        speed_row.addStretch()
+        inputs.addWidget(label("运动速度"), 0, 0)
+        inputs.addLayout(speed_row, 0, 1)
         self.pace = PaceInput()
-        self.pace.setAccessibleName("运动配速（分:秒每公里）")
-        self.pace.setReadOnly(True)
-        speed_row.addWidget(self.pace, 1)
-        speed_row.addWidget(label("分:秒 / 公里", "muted"))
-        options.addLayout(speed_row)
+        inputs.addWidget(label("运动配速"), 1, 0)
+        inputs.addWidget(self.pace, 1, 1)
+        options.addLayout(inputs)
+        options.addSpacing(14)
+        self.remind = QCheckBox("达到目标距离后发送Windows提醒（运动仍会继续）")
+        options.addWidget(self.remind)
         target_row = QHBoxLayout()
         target_row.addWidget(label("预期提醒距离"))
         self.target = DistanceInput()
@@ -258,8 +248,6 @@ class Window(QMainWindow):
         target_row.addWidget(label("公里", "muted"))
         target_row.addStretch()
         options.addLayout(target_row)
-        self.remind = QCheckBox("达到目标后发送 Windows 提醒")
-        options.addWidget(self.remind)
         self.settings_feedback = label("", "settingsFeedback")
         self.settings_feedback.setWordWrap(True)
         self.settings_feedback.setMinimumHeight(30)
@@ -268,7 +256,7 @@ class Window(QMainWindow):
         middle.addWidget(options_card, 1)
         page.addLayout(middle, 1)
 
-        self.message = label("选择路线与速度，点击开始。运行期间请保持 USB 连接。", "message")
+        self.message = label("连接设备并选择路线后，点击「开始」。", "message")
         self.message.setWordWrap(True)
         status_row = QHBoxLayout()
         status_row.addWidget(self.message, 1)
@@ -278,21 +266,19 @@ class Window(QMainWindow):
         status_row.addWidget(self.export_diagnostics, 0, Qt.AlignVCenter)
         page.addLayout(status_row)
         footer = QHBoxLayout()
-        footer.addWidget(label("停止后会发送恢复正常定位命令。", "muted"), 1)
-        self.stop_button = QPushButton("停止并恢复定位")
+        footer.addWidget(label("运行期间请保持 USB 连接。", "muted"), 1)
+        self.run_state = label(f"· {RUN_STATE_LABELS['unready']}", "runState")
+        self.run_state.setProperty("state", "unready")
+        footer.addWidget(self.run_state)
+        footer.addSpacing(6)
+        self.stop_button = QPushButton(END_ACTION)
         self.stop_button.setObjectName("stop")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop)
-        self.pause_button = QPushButton("暂停")
-        self.pause_button.setObjectName("pause")
-        self.pause_button.setEnabled(False)
-        self.pause_button.clicked.connect(self._toggle_pause)
-        self.start_button = QPushButton("开始")
-        self.start_button.setObjectName("start")
-        self.start_button.setMinimumWidth(108)
-        self.start_button.clicked.connect(self.start)
+        self.start_button = RunButton()
+        self.start_button.set_colors(self.palette_colors)
+        self.start_button.clicked.connect(self._primary_action)
         footer.addWidget(self.stop_button)
-        footer.addWidget(self.pause_button)
         footer.addWidget(self.start_button)
         page.addLayout(footer)
 
@@ -313,28 +299,6 @@ class Window(QMainWindow):
         row.addWidget(widget, 1)
         return number, title_label, unit_label
 
-    def _system_appearance_changed(self, *_):
-        self.apply_theme()
-
-    def apply_theme(self, *_):
-        if self._applying_theme:
-            return
-        self._applying_theme = True
-        try:
-            mode = self.theme_choice.currentData() or "system"
-            self.palette_colors = theme.colors(mode)
-            self.setStyleSheet(theme.stylesheet(self.palette_colors))
-            for choice in (self.theme_choice, self.routes, self.target):
-                choice.set_popup_colors(self.palette_colors)
-            self.speed.unit_color = QColor(self.palette_colors["muted"])
-            self.speed.update()
-            self.preview.colors = self.palette_colors
-            self.preview.update()
-            self.settings.setValue("theme", mode)
-            theme.titlebar(self, self.palette_colors["dark"])
-        finally:
-            self._applying_theme = False
-
     def _connected(self, device):
         self._last_seen_device = device
         self.device_name.setText(device.name)
@@ -347,7 +311,7 @@ class Window(QMainWindow):
         self.connection.setText("已连接")
         self.connection.setProperty("connected", True)
         self._refresh_style(self.connection)
-        self._update_start_button()
+        self._update_controls()
 
     def _disconnected(self, reason):
         if reason != self.device_hint.text():
@@ -357,7 +321,7 @@ class Window(QMainWindow):
         self._refresh_style(self.connection)
         self.device_name.setText("连接 iPhone")
         self.device_hint.setText(reason)
-        self._update_start_button()
+        self._update_controls()
 
     @staticmethod
     def _refresh_style(widget):
@@ -370,22 +334,26 @@ class Window(QMainWindow):
         if self._closing or isinstance(self.worker, RunWorker) and self.worker.cancel.is_set():
             return
         self._run_started = time.monotonic()
-        self.run_state.setText("●  运行中")
-        self.run_state.setProperty("active", True)
-        self._refresh_style(self.run_state)
         self.preview.set_running(True)
-        self.pause_button.setEnabled(isinstance(self.worker, RunWorker))
-        self.message.setText("正在运行。估算距离随回放更新。")
+        self._update_controls()
+        self.message.setText("正在模拟路线，请保持 USB 连接。")
 
-    def _toggle_pause(self):
+    def _primary_action(self):
+        if self.worker is None:
+            self.start()
+            return
         if not isinstance(self.worker, RunWorker) or self.worker.cancel.is_set():
             return
-        self.pause_button.setEnabled(False)
+        if self._run_started is None or self._restoring or self._pause_pending:
+            return
+        self._pause_pending = True
+        self._update_controls()
         self.worker.set_paused(self._paused_at is None)
 
     def _pause_changed(self, paused):
-        if not isinstance(self.worker, RunWorker) or self.worker.cancel.is_set():
+        if not isinstance(self.worker, RunWorker) or self.worker.cancel.is_set() or self._restoring:
             return
+        self._pause_pending = False
         now = time.monotonic()
         if paused:
             self._paused_at = now
@@ -394,11 +362,7 @@ class Window(QMainWindow):
             self._paused_at = None
         self._tick()
         self.preview.set_running(not paused)
-        self.run_state.setText("●  已暂停" if paused else "●  运行中")
-        self.run_state.setProperty("active", not paused)
-        self._refresh_style(self.run_state)
-        self.pause_button.setText("继续" if paused else "暂停")
-        self.pause_button.setEnabled(True)
+        self._update_controls()
         self.message.setText("已暂停，模拟定位保留在当前位置。" if paused else "已从暂停位置继续运行。")
 
     def _on_progress(self, fraction):
@@ -464,7 +428,7 @@ class Window(QMainWindow):
         self.route_entries = [(name, str(path), closed) for name, path, closed in entries]
         for name, path, closed in entries:
             self.routes.addItem(name, str(path))
-            self.routes.setItemData(self.routes.count() - 1, "闭合环线" if closed else "非闭合 · 往返", Qt.ToolTipRole)
+            self.routes.setItemData(self.routes.count() - 1, route_kind(closed), Qt.ToolTipRole)
         index = next((i for i, (_, path, _) in enumerate(entries) if self._route_key(path) == preferred), 0)
         self.routes.setCurrentIndex(index if entries else -1)
         self.routes.blockSignals(False)
@@ -494,7 +458,7 @@ class Window(QMainWindow):
             dialog.feedback.setText(message if message != prior_message or message.startswith("路线名称重复") else "")
 
         actions = (
-            (dialog.import_button, self._import_route, False), (dialog.draw_button, self._draw_route, False),
+            (dialog.import_button, self._import_route, False), (dialog.new_button, self._draw_route, False),
             (dialog.edit_button, self._edit_route, True), (dialog.rename_button, self._rename_route, True),
             (dialog.delete_button, self._delete_route, True), (dialog.copy_button, self._copy_route, True),
             (dialog.export_button, self._export_route, True),
@@ -631,7 +595,7 @@ class Window(QMainWindow):
         try:
             path = self.routes.currentData()
             if not path:
-                self.message.setText("请绘制路线或导入 GPX 文件。")
+                self.message.setText("点击「新建…」绘制路线，或在「管理…」中导入 GPX 文件。")
                 self.route_info.setText("尚无路线")
             else:
                 self._show_route(Path(path))
@@ -645,8 +609,7 @@ class Window(QMainWindow):
         self.lap_title.setText("完成圈数" if closed else "完成往返")
         self.lap_unit.setText("圈" if closed else "次")
         self._on_progress(0)
-        self._update_start_button()
-        self.export_button.setEnabled(self.route is not None and self.worker is None)
+        self._update_controls()
 
     def _clear_stats(self):
         self.laps.setText("0")
@@ -659,44 +622,28 @@ class Window(QMainWindow):
         if path.suffix != ".json":
             details = f"{path.name}    ·    {details}"
         self.route_info.setText(details)
-        self.message.setText("选择路线与速度，点击开始。请在运行期间保持 USB 连接。")
+        self.message.setText("连接设备并选择路线后，点击「开始」。")
 
     @staticmethod
     def _valid_speed(speed):
         return math.isfinite(speed) and 0.1 <= speed <= 15
 
-    def _sync_speed_inputs(self):
-        with QSignalBlocker(self.speed), QSignalBlocker(self.pace):
-            self.speed.setValue(self._speed_mps)
-            self.pace.setText(pace_text(self._speed_mps).split(" / ")[0])
-
-    def _select_speed_entry(self, edit_speed):
-        self._sync_speed_inputs()
-        self.speed.setReadOnly(not edit_speed)
-        self.pace.setReadOnly(edit_speed)
-        self.settings_feedback.setText("可编辑运动速度。" if edit_speed else "可编辑配速，格式为分:秒。")
-
     def _speed_changed(self, speed):
-        if not self.speed_mode.isChecked():
-            return
         if not self._valid_speed(speed):
-            self.settings_feedback.setText("请输入 0.10–15.00 m/s，当前速度继续生效。")
+            self.settings_feedback.setText("请输入 0.10–15.00 米/秒，当前速度继续生效。")
+            self._update_controls()
             return
-        text = pace_text(speed)
-        with QSignalBlocker(self.pace):
-            self.pace.setText(text.split(" / ")[0])
-        self._apply_speed(speed, f"速度已更新为 {speed:.2f} m/s，配速约 {text}。")
+        self.pace.set_speed(speed)
+        self._apply_speed(speed, f"速度已更新为 {speed:.2f} 米/秒，配速约 {pace_text(speed)}。")
 
-    def _pace_changed(self, _):
-        if not self.pace_mode.isChecked():
-            return
-        speed = self.pace.speed()
+    def _pace_changed(self, speed):
         if not self._valid_speed(speed):
-            self.settings_feedback.setText("请输入 1:07–166:40 的配速，当前速度继续生效。")
+            self.settings_feedback.setText("配速请输入 1 分 07 秒至 166 分 40 秒，当前速度继续生效。")
+            self._update_controls()
             return
         with QSignalBlocker(self.speed):
             self.speed.setValue(speed)
-        self._apply_speed(speed, f"配速已更新为 {self.pace.text()} / 公里，速度约 {speed:.2f} m/s。")
+        self._apply_speed(speed, f"配速已更新为 {pace_text(speed)}，速度约 {self.speed.text()} 米/秒。")
 
     def _apply_speed(self, speed, message):
         self._speed_mps = speed
@@ -708,6 +655,7 @@ class Window(QMainWindow):
             self._reminder_m = self._parse_target(text)
         except ValueError as error:
             self.settings_feedback.setText(str(error))
+            self._update_controls()
             return
         self.settings.setValue("target", text)
         self._apply_run_settings(f"提醒距离已更新为 {self._reminder_m / 1000:g} 公里。")
@@ -718,7 +666,7 @@ class Window(QMainWindow):
             try:
                 self._parse_target(self.target.currentText())
             except ValueError:
-                self.target.setEditText(f"{self._reminder_m / 1000:g}")
+                self.target.setCurrentText(f"{self._reminder_m / 1000:g}")
         self.settings.setValue("remind", "true" if enabled else "false")
         self._apply_run_settings(
             f"Windows 提醒已开启，达到 {self._reminder_m / 1000:g} 公里时提醒。"
@@ -729,6 +677,7 @@ class Window(QMainWindow):
         self.settings_feedback.setText(message)
         if isinstance(self.worker, RunWorker):
             self.worker.update_settings(self._speed_mps, self._reminder_m if self.remind.isChecked() else None)
+        self._update_controls()
 
     def _probe(self):
         if self._closing or self._pending_start or self.worker is not None or self.probe_worker is not None:
@@ -747,8 +696,10 @@ class Window(QMainWindow):
             worker.deleteLater()
         if self._pending_start and not self._closing:
             self._pending_start = False
-            self._set_controls(False)
-            QTimer.singleShot(0, self.start)
+            self.start()
+            self._update_controls()
+        elif isinstance(self.worker, RestoreWorker):
+            self.worker.start()
         self._finish_close()
 
     def _target_m(self):
@@ -758,34 +709,19 @@ class Window(QMainWindow):
 
     @staticmethod
     def _parse_target(text):
-        try:
-            value = float(text)
-            if not math.isfinite(value) or not 0 < value <= 1000:
-                raise ValueError
-        except ValueError as error:
-            raise ValueError("请输入大于 0、且不超过 1000 的提醒公里数，例如 2、3 或 2.5。") from error
-        return value * 1000
+        if (len(text) > 4 or not text.isascii() or not text.isdecimal()
+                or text.startswith("0") or int(text) > 1000):
+            raise ValueError("请输入 1–1000 之间的整数公里数。")
+        return int(text) * 1000
 
     def start(self):
-        if self.worker is not None or self.route is None or self._closing or self._pending_restore is not None:
-            return
-        if issue := self._connected_support_issue():
-            self.message.setText(issue)
-            return
-        try:
-            target = self._target_m()
-        except ValueError as error:
-            self.message.setText(str(error))
+        if not self._can_start():
             return
         if self.probe_worker is not None:
             self._pending_start = True
-            self.start_button.setEnabled(False)
+            self._update_controls()
             self.probe_worker.cancel.set()
-            self.message.setText("正在连接手机，请稍候…")
-            return
-        entry_speed = self.speed.value() if self.speed_mode.isChecked() else self.pace.speed()
-        if not self._valid_speed(entry_speed):
-            self.settings_feedback.setText("请输入有效的运动速度或配速，再开始模拟。")
+            self.message.setText("正在连接设备，请保持 USB 连接并稍候…")
             return
         self._last_restore_failed = False
         self._last_run_error = None
@@ -793,9 +729,9 @@ class Window(QMainWindow):
         self._run_started = None
         self._paused_at = None
         self._on_progress(0)
-        self._set_controls(True)
-        worker = RunWorker(self.backend, self.route, self._speed_mps, target, self)
+        worker = RunWorker(self.backend, self.route, self._speed_mps, self._target_m(), self)
         self.worker = worker
+        self._update_controls()
         worker.ready.connect(self._ready)
         worker.message.connect(self.message.setText)
         worker.progress.connect(self._on_progress)
@@ -804,51 +740,83 @@ class Window(QMainWindow):
         worker.lap.connect(self._lap)
         worker.target_reached.connect(self._notify)
         worker.failed.connect(self._failed)
+        worker.restoring.connect(self._begin_restore)
         worker.restored.connect(self._restored)
         worker.finished.connect(self._run_finished)
-        self.message.setText("正在准备设备，请保持手机解锁…")
+        self.message.setText("正在连接设备，请保持 iPhone 或 iPad 解锁并稍候…")
         worker.start()
 
-    def _connected_support_issue(self):
-        if self.connection.property("connected") and self._last_seen_device is not None:
-            return self._last_seen_device.support_issue
-        return ""
+    def _can_start(self):
+        if (self.worker is not None or self._pending_start or self._closing or self.route is None
+                or self._pending_restore is not None or not self.connection.property("connected")
+                or self._last_seen_device is None or self._last_seen_device.support_issue):
+            return False
+        if not self._valid_speed(self.speed.value()) or not self._valid_speed(self.pace.speed()):
+            return False
+        try:
+            self._target_m()
+        except ValueError:
+            return False
+        return True
 
-    def _update_start_button(self, running=False):
-        self.start_button.setEnabled(
-            not running and self.worker is None and not self._pending_start and not self._closing
-            and self.route is not None and self._pending_restore is None and not self._connected_support_issue()
-        )
+    def _update_controls(self):
+        playing = self._run_started is not None and not self._restoring
+        paused = self._paused_at is not None
+        loading = self._pending_start or self._pause_pending or isinstance(self.worker, RunWorker) and not playing
+        ready = not playing and not self._restoring and self._can_start()
+        if self._restoring:
+            state = "restoring"
+        elif loading:
+            state = "loading"
+        elif playing:
+            state = "paused" if paused else "running"
+        else:
+            state = "ready" if ready else "unready"
+        if self.run_state.property("state") != state:
+            self.run_state.setText(f"· {RUN_STATE_LABELS[state]}")
+            self.run_state.setProperty("state", state)
+            self._refresh_style(self.run_state)
+        has_playback = playing and isinstance(self.worker, RunWorker) and not self.worker.cancel.is_set()
+        action = ("继续" if paused else "暂停") if playing else "开始"
+        self.start_button.set_action(action, not self._closing and (ready or has_playback and not self._pause_pending))
+        can_retry = self.worker is None and self._pending_restore is not None
+        self.stop_button.setEnabled(not self._closing and (ready or has_playback or can_retry))
+        editable = self.worker is None and not self._pending_start and not playing and not self._closing
+        for control in (self.routes, self.manage_button, self.new_button):
+            control.setEnabled(editable)
 
-    def _set_controls(self, running):
-        self._update_start_button(running)
-        can_retry = self._pending_restore is not None or self._last_restore_device is not None
-        self.stop_button.setEnabled(running or can_retry)
-        self.stop_button.setText("停止并恢复定位" if running or not can_retry else "再次恢复定位")
-        self.routes.setEnabled(not running)
-        self.manage_button.setEnabled(not running)
-        self.import_button.setEnabled(not running)
-        self.draw_button.setEnabled(not running)
-        self.export_button.setEnabled(not running and self.route is not None)
+    def _begin_restore(self):
+        if not self._restoring:
+            self._tick()
+            self._restoring = True
+            self.preview.set_running(False)
+            self._update_controls()
 
     def stop(self):
-        if self.worker:
-            self.stop_button.setEnabled(False)
-            self.pause_button.setEnabled(False)
-            self.message.setText("正在停止，请等待恢复定位完成…")
+        if self._restoring:
+            return
+        if isinstance(self.worker, RunWorker):
+            if self._run_started is not None:
+                self._begin_restore()
+            self.message.setText("正在停止，请保持 USB 连接并稍候…")
             LOG.info("Stop requested")
             self.worker.stop()
 
-        elif (device := self._pending_restore or self._last_restore_device) is not None:
+        elif self.worker is None:
+            device = self._pending_restore or (self._last_seen_device if self._can_start() else None)
+            if device is None:
+                return
             self._last_run_error = None
-            self._set_controls(True)
-            self.stop_button.setEnabled(False)
             worker = RestoreWorker(self.backend, device, self)
             self.worker = worker
+            self._begin_restore()
             worker.restored.connect(self._restored)
             worker.finished.connect(self._run_finished)
-            self.message.setText("正在重新尝试恢复正常定位…")
-            worker.start()
+            self.message.setText("正在尝试恢复正常定位，请保持 USB 连接并稍候…")
+            if self.probe_worker is not None:
+                self.probe_worker.cancel.set()
+            else:
+                worker.start()
 
     def _failed(self, text):
         self._last_run_error = self._last_diagnostic_error = text
@@ -876,7 +844,7 @@ class Window(QMainWindow):
         self.distance.setText(f"{distance / 1000:.2f}")
 
     def _notify(self, distance):
-        ending = "运动将继续，请手动停止。"
+        ending = f"运动将继续。要结束，请点击「{END_ACTION}」。"
         self.message.setText(f"已达到目标！已运动距离（估算）{distance / 1000:.2f} 公里。{ending}")
         try:
             from winotify import Notification
@@ -889,35 +857,34 @@ class Window(QMainWindow):
 
     def _restored(self, success, message):
         self._last_restore_failed = not success
+        lines = ((self._last_run_error or "") + "\n" + message).splitlines()
+        summary = "\n".join(dict.fromkeys(filter(None, lines)))
         if not success:
-            self._last_diagnostic_error = "\n".join(filter(None, (self._last_run_error, message)))
+            self._last_diagnostic_error = summary
         self._pending_restore = None if success else getattr(self.worker, "device", None)
-        # Do not overwrite the original preparation error with a generic "stopped" message.
-        if message != "已停止。":
-            self._last_restore_device = getattr(self.worker, "device", None)
-            self.message.setText((self._last_run_error + "\n" if self._last_run_error else "") + message)
+        if message == SETUP_STOPPED:
+            if not self._last_run_error:
+                self.message.setText(message)
+        else:
+            self.message.setText(summary)
 
     def _run_finished(self):
         self._tick()
         self._run_started = None
         self._paused_at = None
+        self._restoring = self._pause_pending = False
         worker = self.worker
         self.worker = None
         if worker:
             worker.deleteLater()
-        self.run_state.setText("●  未运行")
-        self.run_state.setProperty("active", False)
-        self._refresh_style(self.run_state)
         self.preview.set_running(False)
-        self.pause_button.setEnabled(False)
-        self.pause_button.setText("暂停")
-        self._set_controls(False)
+        self._update_controls()
         if self._last_restore_failed:
-            QMessageBox.warning(self, "请检查手机定位", self.message.text())
+            QMessageBox.warning(self, "未能恢复定位", self.message.text())
         self._finish_close()
 
     def _tick(self):
-        if self._run_started is not None:
+        if self._run_started is not None and not self._restoring:
             now = self._paused_at if self._paused_at is not None else time.monotonic()
             seconds = max(0, int(now - self._run_started))
             self.elapsed.setText(f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}" if seconds >= 3600
@@ -926,11 +893,6 @@ class Window(QMainWindow):
     def closeEvent(self, event):
         if self._allow_close:
             self.preview.set_running(False)
-            try:
-                QApplication.styleHints().colorSchemeChanged.disconnect(self._system_appearance_changed)
-                QApplication.instance().paletteChanged.disconnect(self._system_appearance_changed)
-            except (RuntimeError, TypeError):
-                pass
             if self.route:
                 self.settings.setValue("route", self._route_key(self.route.path))
             event.accept()
@@ -955,7 +917,6 @@ class Window(QMainWindow):
 def run():
     parser = argparse.ArgumentParser(description="IRun Windows desktop application")
     parser.add_argument("--screenshot", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--theme", choices=("system", "light", "dark"), help=argparse.SUPPRESS)
     parser.add_argument("--running-preview", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.screenshot:
@@ -965,6 +926,7 @@ def run():
     logging.basicConfig(filename=data_dir() / "irun.log", encoding="utf-8", level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     application = QApplication(sys.argv[:1])
+    application.styleHints().setColorScheme(Qt.ColorScheme.Light)
     if args.screenshot:
         for font in ("msyh.ttc", "msyhbd.ttc", "segoeui.ttf"):
             path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / font
@@ -976,12 +938,9 @@ def run():
     application.setStyle("Fusion")
     if args.screenshot:
         args.screenshot.parent.mkdir(parents=True, exist_ok=True)
-        settings = QSettings(str(args.screenshot.parent / ("preview-" + (args.theme or "system") + ".ini")), QSettings.IniFormat)
-        if args.theme:
-            settings.setValue("theme", args.theme)
+        settings = QSettings(str(args.screenshot.parent / "preview.ini"), QSettings.IniFormat)
         window = Window(settings=settings, poll=False)
         if args.running_preview and window.route is not None:
-            window._set_controls(True)
             window._ready(Device("preview", "iPhone · 运行界面预览", "17.6"))
             window._run_started = time.monotonic() - 462
             window._tick()
@@ -991,8 +950,6 @@ def run():
             window.message.setText("运行界面预览：未连接或控制手机。当前位置与本圈进度会随运动实时更新。")
     else:
         window = Window()
-        if args.theme:
-            window.theme_choice.setCurrentIndex(window.theme_choice.findData(args.theme))
     window.show()
     if args.screenshot:
         def capture():

@@ -22,10 +22,19 @@ from ios17_helper.images import (ROOT as IMAGE_ROOT, check_bundled_images, prepa
                                  validate_image)
 
 LOG = logging.getLogger("IRun.iOS17")
+CLEAR_DELIVERY_GRACE_SECONDS = 0.5
 
 
 class SetupHint(RuntimeError):
     pass
+
+
+DEVELOPER_MODE_HINT = (
+    "请在 iPhone 或 iPad 上打开「设置 → 隐私与安全性 → 开发者模式」。"
+    "开启后按提示重启，解锁并点「打开」。然后通过 USB 重新连接电脑，在 IRun 中点击「开始」。"
+)
+RECONNECT_HINT = "请解锁 iPhone 或 iPad，重新插拔 USB 线，再在 IRun 中点击「开始」。"
+DEVELOPER_MODE_MISSING = "如果设备上没有这个选项，请解锁后重新插拔 USB 线，再点击「开始」。"
 
 
 def emit(**message):
@@ -34,29 +43,39 @@ def emit(**message):
     print(json.dumps(message, ensure_ascii=True), flush=True)
 
 
-def explain(error):
+def explain(error, identifier, operation=None):
     if isinstance(error, SetupHint):
         return str(error)
     name = type(error).__name__
     lower = (name + " " + str(error)).lower()
     if "developer" in lower and ("mode" in lower or "enabled" in lower):
-        return "请在 iPhone 的“设置 → 隐私与安全性 → 开发者模式”中开启开发者模式，重启并确认。"
+        return DEVELOPER_MODE_HINT
     if "locked" in lower or "password" in lower or "passcode" in lower:
-        return "请先解锁 iPhone，再点击开始。"
+        return "请先解锁 iPhone 或 iPad，再在 IRun 中点击「开始」。"
     if "pairingdialog" in lower or "userdenied" in lower or "notpaired" in lower:
-        return "请在 iPhone 上确认“信任此电脑”，完成后再次点击开始。"
-    if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
-        return "iOS 17+ 准备或通信超时，请检查 USB、手机解锁状态和下载镜像所需的网络。"
+        return "请解锁 iPhone 或 iPad，在设备上点「信任此电脑」，再在 IRun 中点击「开始」。"
     if isinstance(error, ImportError):
-        return "iOS 17+ 依赖缺失，请重新安装完整的 IRun 安装包。"
-    return f"iOS 17+ 设备通信失败（{name}）：{str(error)[:350]}"
+        return "IRun 的设备连接组件缺失。请重新运行 IRun 安装包。"
+    if identifier != 0:
+        if operation == "clear":
+            return "发送恢复定位指令超时。" if isinstance(error, TimeoutError) else "未能发送恢复定位指令。"
+        return ("设备定位服务响应超时。" if isinstance(error, TimeoutError) else "设备定位服务通信失败。")
+    if isinstance(error, TimeoutError):
+        return "设备连接超时。" + RECONNECT_HINT
+    return "未能连接设备。" + RECONNECT_HINT + " 如果仍失败，请点击「导出诊断日志」。"
 
 
-def emit_error(identifier, error):
-    codes = {key: value for key in ("code", "status_code", "errno", "winerror")
-             if isinstance(value := getattr(error, key, None), int)}
-    emit(id=identifier, ok=False, error=explain(error), error_type=type(error).__name__,
-         detail=str(error)[:4096], codes=codes)
+def emit_error(identifier, error, operation=None):
+    causes, codes = [], {}
+    cause = error
+    while cause is not None and cause not in causes:
+        causes.append(cause)
+        for key in ("code", "status_code", "errno", "winerror"):
+            if type(value := getattr(cause, key, None)) is int:
+                codes.setdefault(key, value)
+        cause = cause.__cause__
+    emit(id=identifier, ok=False, error=explain(error, identifier, operation), error_type=type(error).__name__,
+         detail="\n".join(str(cause) for cause in causes)[:4096], codes=codes)
 
 
 def early_ios17(version):
@@ -86,6 +105,7 @@ async def prepare_developer_image(rsd):
     from pymobiledevice3.services.mobile_image_mounter import PersonalizedImageMounter, uses_cryptex_image
     from pymobiledevice3.services.cryptexd import CryptexdService, DDI_CRYPTEX_IDENTIFIER
 
+    emit(event="status", message="正在检查 iPhone 或 iPad 是否已加载定位测试所需的开发者镜像，请稍候…")
     cryptex = uses_cryptex_image(rsd)
     if cryptex:
         if any(image.identifier == DDI_CRYPTEX_IDENTIFIER for image in await CryptexdService(rsd).copy_installed()):
@@ -95,10 +115,11 @@ async def prepare_developer_image(rsd):
             if await mounter.is_image_mounted(PersonalizedImageMounter.IMAGE_TYPE):
                 return
     variant = "Cryptex" if cryptex else "Personalized"
+    action = "安装" if cryptex else "加载"
     bundled = IMAGE_ROOT / variant
-    emit(event="status", message="正在使用预置开发者镜像…")
     try:
         validate_image(bundled, variant)
+        emit(event="status", message=f"正在将 IRun 附带的开发者镜像{action}到 iPhone 或 iPad，请保持 USB 连接并稍候…")
         await mount_image(rsd, variant, bundled)
         return
     except Exception:
@@ -108,25 +129,27 @@ async def prepare_developer_image(rsd):
     cached = sorted((p for p in cache.glob("*") if p.is_dir() and not p.name.startswith("download-")),
                     key=lambda p: p.stat().st_mtime)
     for directory in cached[-1:]:
-        emit(event="status", message="正在尝试已下载的开发者镜像…")
         try:
             validate_image(directory, variant)
+            emit(event="status", message=f"正在将电脑上已下载的开发者镜像{action}到 iPhone 或 iPad，请保持 USB 连接并稍候…")
             await mount_image(rsd, variant, directory)
             return
         except Exception:
             LOG.warning("Cached %s developer image could not be used", variant, exc_info=True)
 
-    emit(event="status", message="本地镜像未能使用，正在从 GitHub 下载开发者镜像…")
+    emit(event="status", message="正在通过电脑网络下载开发者镜像，请保持 USB 和网络连接并稍候…")
     try:
         directory = await asyncio.to_thread(prepare_remote_image, cache, variant)
     except Exception as error:
-        raise SetupHint("预置镜像未能使用，在线镜像也未能下载或校验。"
-                        "请检查电脑能否访问 raw.githubusercontent.com，然后重试。") from error
+        raise SetupHint("无法下载或验证开发者镜像。请确认电脑能访问 GitHub，再在 IRun 中点击「开始」。"
+                        "如果仍失败，请点击「导出诊断日志」。") from error
     try:
+        emit(event="status", message=f"下载完成，正在将开发者镜像{action}到 iPhone 或 iPad，请保持 USB 连接并稍候…")
         await mount_image(rsd, variant, directory)
     except Exception as error:
-        raise SetupHint("已下载开发者镜像，但设备未能接受。请检查 USB、开发者模式及苹果签名服务 "
-                        f"gs.apple.com 的网络连接，然后重试。详细信息：{str(error)[:190]}") from error
+        raise SetupHint(f"开发者镜像未能{action}到 iPhone 或 iPad。请保持设备解锁，"
+                        "确认电脑能联网，再在 IRun 中点击「开始」。"
+                        "如果仍失败，请点击「导出诊断日志」。") from error
 
 
 async def open_paired_usb(udid):
@@ -164,7 +187,7 @@ async def open_paired_usb(udid):
                 or not message.startswith("usbmuxd rejected the SavePairRecord request:")
                 or not re.search(r"['\"]Number['\"]:\s*183\b", message)):
             raise
-        emit(event="status", message="正在重新验证 Windows 上已有的 USB 配对记录…")
+        emit(event="status", message="正在重新验证电脑与 iPhone 或 iPad 的 USB 配对，请保持设备解锁并稍候…")
         # Pairing writes the local copy before asking Windows to save its copy.
         # Default lookup may keep picking an older Windows record first.
         local = await open_local_record()
@@ -177,10 +200,9 @@ async def open_paired_usb(udid):
                 return connection, None
             await connection.close()
         raise SetupHint(
-            "USB 配对记录未通过验证（SavePairRecord 183）。"
-            "请解锁设备，打开 Windows 上的「Apple 设备」或 iTunes，"
-            "确认能看到这台设备并在手机上选择「信任此电脑」，再回到 IRun 点击开始。"
-            "配对成功后，IRun 才能检查并尝试显示「开发者模式」开关。"
+            "电脑未能验证 USB 配对（SavePairRecord 183）。请解锁 iPhone 或 iPad 并重新插拔 USB 线。"
+            "如果设备弹出「信任此电脑」，请点「信任」，再在 IRun 中点击「开始」。"
+            "如果仍失败，请点击「导出诊断日志」。"
         ) from error
 
 
@@ -197,39 +219,36 @@ class Session:
         from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
         from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
 
-        emit(event="status", message="正在验证 USB 配对，请保持设备解锁…")
+        emit(event="status", message="正在验证 USB 配对，请保持 iPhone 或 iPad 解锁。若设备弹出「信任此电脑」，请点「信任」。")
         lockdown, recovered_record = await open_paired_usb(self.udid)
         self.stack.push_async_callback(lockdown.close)
         if lockdown.udid != self.udid:
-            raise RuntimeError("设备标识不匹配，已取消连接。")
+            raise SetupHint("连接的设备已变化。请通过 USB 连接要使用的 iPhone 或 iPad，再点击「开始」。")
         version = lockdown.product_version
         if int(version.split(".")[0]) < 17:
             raise SetupHint(f"当前设备系统为 {version}。IRun 需要 iOS 或 iPadOS 17 及以上。")
-        emit(event="status", message="USB 配对已通过，正在检查开发者模式…")
+        emit(event="status", message="正在检查 iPhone 或 iPad 的开发者模式，请稍候…")
         if not await lockdown.get_developer_mode_status():
             try:
                 await AmfiService(lockdown).reveal_developer_mode_option_in_ui()
             except Exception as error:
                 LOG.warning("Could not reveal the Developer Mode setting", exc_info=True)
                 raise SetupHint(
-                    "开发者模式未开启，IRun 未能显示开关。请保持设备解锁并重新连接后重试。"
-                    "如果「设置 → 隐私与安全性」里仍无此项，可连接运行 Xcode 的 Mac 发起设备配对，"
-                    "再回到设备上开启开发者模式并在重启后确认。"
+                    "开发者模式未开启。" + DEVELOPER_MODE_HINT + DEVELOPER_MODE_MISSING +
+                    "如果选项仍未出现，可在 Mac 上用 Xcode 配对设备。"
                 ) from error
-            raise SetupHint(
-                "开发者模式未开启，已请求显示开关。请在设备上打开「设置 → 隐私与安全性 → 开发者模式」，"
-                "开启后按提示重启，解锁并确认「打开」，再重新连接 IRun。"
-            )
+            raise SetupHint("开发者模式未开启。" + DEVELOPER_MODE_HINT + DEVELOPER_MODE_MISSING)
         if early_ios17(version):
             if not windows_admin():
-                raise SetupHint("iOS 17.0–17.3.x 需要管理员权限。请退出 IRun，右键快捷方式，选择「以管理员身份运行」。")
+                raise SetupHint("此系统版本需要 Windows 管理员权限。请关闭 IRun，在电脑上右键点击 IRun 快捷方式，"
+                                "选择「以管理员身份运行」，再点击「开始」。")
             try:
                 rsd = await asyncio.wait_for(self._early_tunnel(), 45)
             except Exception as error:
-                raise SetupHint("无法建立 iOS 17.0–17.3.x 开发者连接。请检查设备管理器中的 Apple 网络设备驱动，"
-                                "确认 Windows 网络适配器已启用 IPv6，重新插拔 USB 后重试。") from error
+                raise SetupHint("无法连接设备的定位测试服务。" + RECONNECT_HINT +
+                                " 如果仍失败，请点击「导出诊断日志」。") from error
         else:
-            emit(event="status", message="正在建立 iOS 17.4+ USB 开发者隧道…")
+            emit(event="status", message="正在通过 USB 连接设备的定位测试服务，请保持 USB 连接并稍候…")
             tunnel = userspace_tunnel.UserspaceRsdTunnel(
                 serial=self.udid, autopair=False, remotepairing_fallback=False)
             original_connect = userspace_tunnel.create_using_usbmux
@@ -243,8 +262,9 @@ class Session:
             finally:
                 userspace_tunnel.create_using_usbmux = original_connect
         if rsd.udid != self.udid:
-            raise RuntimeError("开发者隧道连接到了其他设备，已停止。")
+            raise SetupHint("连接指向了其他设备。请只连接要使用的 iPhone 或 iPad，再点击「开始」。")
         await prepare_developer_image(rsd)
+        emit(event="status", message="正在启动设备的定位测试服务，请稍候…")
         provider = await self.stack.enter_async_context(DvtProvider(rsd))
         self.location = await self.stack.enter_async_context(LocationSimulation(provider))
 
@@ -253,7 +273,7 @@ class Session:
         from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
         from pymobiledevice3.remote.tunnel_service import get_core_device_tunnel_services, start_tunnel
 
-        emit(event="status", message="正在建立 iOS 17.0–17.3 QUIC 隧道，请保持 USB 和 IPv6 网络可用…")
+        emit(event="status", message="正在通过 USB 连接设备的定位测试服务，请保持 USB 连接并稍候…")
         services = await get_core_device_tunnel_services(udid=self.udid)
         for service in services:
             self.stack.push_async_callback(service.close)
@@ -277,6 +297,9 @@ class Session:
     async def clear(self):
         await asyncio.wait_for(self.location.clear(), 8)
         self.location_attempted = False
+        # stopLocationSimulation has no device reply. Keep the DTX channel and
+        # the USB tunnel open briefly before reporting that the command was sent.
+        await asyncio.sleep(CLEAR_DELIVERY_GRACE_SECONDS)
 
     async def close(self):
         try:
@@ -296,19 +319,21 @@ async def serve(udid):
             if not line:
                 break
             identifier = None
+            operation = None
             try:
                 request = json.loads(line)
                 identifier = request["id"]
-                if request["op"] == "set":
+                operation = request["op"]
+                if operation == "set":
                     await session.set(request["lat"], request["lng"])
-                elif request["op"] == "clear":
+                elif operation == "clear":
                     await session.clear()
                 else:
                     raise ValueError("未知的定位操作。")
                 emit(id=identifier, ok=True)
             except Exception as error:
-                LOG.exception("Location operation failed")
-                emit_error(identifier, error)
+                LOG.exception("Location operation failed (%r)", operation)
+                emit_error(identifier, error, operation)
     except Exception as error:
         LOG.exception("Developer service setup failed")
         emit_error(0, error)

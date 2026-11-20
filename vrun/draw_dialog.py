@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                              QMessageBox, QPushButton, QVBoxLayout)
 
 from .map_tiles import MapTiles
@@ -11,7 +11,7 @@ from .offline_maps import OSM_ATTRIBUTION
 from .route_library import MAX_ROUTE_NAME_LENGTH, export_gpx, save_route
 from .route_map import MAX_LATITUDE, RouteMap, project
 from .routes import MAX_ROUTE_POINTS, Point, build_route, parse_point
-from .widgets import ChoiceBox
+from .widgets import ChoiceBox, MapDialog
 
 PRESET_SETTING = "maps/lastPreset"
 
@@ -35,10 +35,10 @@ def choose_gpx_destination(parent, name, points):
     return True
 
 
-class DrawRouteDialog(QDialog):
+class DrawRouteDialog(MapDialog):
     def __init__(self, directory, center, colors, parent=None, *, settings, route=None, name=None, existing=None,
                  reserved_names=None):
-        super().__init__(parent)
+        super().__init__(parent, 1180, 820)
         self.directory = directory
         self.settings = settings
         self._initial_view_pending = True
@@ -48,8 +48,7 @@ class DrawRouteDialog(QDialog):
         self.reserved_names = reserved_names
         self.route = None
         self.setObjectName("drawRouteDialog")
-        self.setWindowTitle("编辑路线" if route is not None else "绘制路线")
-        self.resize(850, 650)
+        self.setWindowTitle("编辑路线" if self._editing else "新建路线")
         layout = QVBoxLayout(self)
         toolbar = QHBoxLayout()
         self.location = QLineEdit()
@@ -63,7 +62,7 @@ class DrawRouteDialog(QDialog):
         self.map = RouteMap(center if center is not None else Point(0, 0), self.tiles, colors)
         if center is None:
             self.map.move_view(self.map.center, 4)
-        self._button(toolbar, "适应路线", self.map.fit_route)
+        self._button(toolbar, "适应缩放", self._fit_content)
         self.preset_choice = None
         if self.tiles.offline.views:
             self.preset_choice = ChoiceBox(self)
@@ -101,7 +100,7 @@ class DrawRouteDialog(QDialog):
         layout.addLayout(map_info)
 
         edit = QHBoxLayout()
-        self.name = QLineEdit(name if name is not None else "手绘路线")
+        self.name = QLineEdit(name if name is not None else "新建路线")
         self.name.setAccessibleName("路线名称")
         self.name.setPlaceholderText("路线名称")
         self.name.setMaxLength(MAX_ROUTE_NAME_LENGTH)
@@ -152,8 +151,13 @@ class DrawRouteDialog(QDialog):
 
     def _fit_preset(self, view):
         west, south, east, north = view.get("focus_bounds", view["bounds"])
-        self.map.fit_projected([project(Point(north, west)), project(Point(south, east))],
-                               padding=24, minimum_zoom=15)
+        self.map.fit_projected((project(Point(north, west)), project(Point(south, east))), padding=16)
+
+    def _fit_content(self):
+        if self.map.points:
+            self.map.fit_route()
+        elif self.preset_choice is not None and (view := self.preset_choice.currentData()):
+            self._fit_preset(view)
 
     def _add_coordinate(self):
         point = self._read_coordinate()
@@ -178,10 +182,7 @@ class DrawRouteDialog(QDialog):
         super().showEvent(event)
         if self._initial_view_pending:
             self._initial_view_pending = False
-            if self._editing:
-                QTimer.singleShot(0, self, self.map.fit_route)
-            elif self.preset_choice is not None and (view := self.preset_choice.currentData()):
-                QTimer.singleShot(0, self, lambda: self._fit_preset(view))
+            QTimer.singleShot(0, self, self._fit_content)
 
     def _retry_tiles(self):
         self.tiles.failed.clear()
@@ -190,11 +191,12 @@ class DrawRouteDialog(QDialog):
     def _update_map_status(self):
         self.retry_button.setVisible(bool(self.tiles.failed))
         if self.tiles.failed:
-            text = "OpenStreetMap 底图加载失败。请使用能访问 OpenStreetMap 的网络代理，仍可绘制和保存路线。"
+            text = ("无法加载 OpenStreetMap 底图。请检查网络或代理，然后点击「重试底图」。"
+                    "也可以继续绘制和保存路线。")
         elif self.tiles.offline_visible and not self.tiles.has_online_tiles:
             text = "正在显示离线底图，无需联网。"
         elif self.tiles.pending:
-            text = "正在加载 OpenStreetMap 底图…"
+            text = "正在加载 OpenStreetMap 底图，请稍候…"
         else:
             text = ""
         self.map_status.setText(text)

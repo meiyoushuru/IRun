@@ -6,12 +6,13 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QFrame, QMenu, QToolButton, QVBoxLayout, QWidget
 
+from .map_tiles import MAX_TILE_ZOOM, TILE_SIZE, tile_zoom, visible_tiles
 from .routes import MAX_ROUTE_POINTS, Point
 
 
-TILE_SIZE = 256
 MAX_LATITUDE = 85.0511287798066
 EARTH_RADIUS_M = 6378137
+ZOOM_STEP = 0.25
 
 
 def project(point: Point) -> QPointF:
@@ -26,17 +27,25 @@ def unproject(position: QPointF) -> Point:
     return Point(math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y)))), x * 360 - 180)
 
 
-def visible_tiles(origin, width, height, zoom, world_size):
-    count = 2 ** zoom
-    tile_size = world_size / count
-    left = math.floor(origin.x() / tile_size)
-    right = math.ceil((origin.x() + width) / tile_size)
-    top = max(0, math.floor(origin.y() / tile_size))
-    bottom = min(count, math.ceil((origin.y() + height) / tile_size))
-    for x in range(left, right):
-        for y in range(top, bottom):
-            yield (zoom, x % count, y), QRectF(x * tile_size - origin.x(),
-                y * tile_size - origin.y(), tile_size, tile_size)
+def project_route(points, near_x=None):
+    result = []
+    for point in points:
+        position = project(point)
+        if near_x is not None:
+            position.setX(position.x() + round(near_x - position.x()))
+        result.append(position)
+        near_x = position.x()
+    return result
+
+
+def projected_bounds(points):
+    return QRectF(QPointF(min(p.x() for p in points), min(p.y() for p in points)),
+                  QPointF(max(p.x() for p in points), max(p.y() for p in points)))
+
+
+def fitted_zoom(bounds, width, height, *, single_point_zoom=MAX_TILE_ZOOM):
+    scale = max(bounds.width() / max(1, width), bounds.height() / max(1, height))
+    return max(0, min(MAX_TILE_ZOOM, -math.log2(TILE_SIZE * scale))) if scale else single_point_zoom
 
 
 class MapScale(QWidget):
@@ -88,6 +97,7 @@ class RouteMap(QWidget):
         super().__init__(parent)
         self.center = project(center)
         self.zoom = 16
+        self._fitted_view = None
         self.tiles = tiles
         self.colors = colors
         self.points = []
@@ -133,8 +143,8 @@ class RouteMap(QWidget):
         return button
 
     def _refresh_controls(self):
-        self.zoom_in.setEnabled(self.zoom < 19)
-        self.zoom_out.setEnabled(self.zoom > 2)
+        self.zoom_in.setEnabled(self.zoom < MAX_TILE_ZOOM)
+        self.zoom_out.setEnabled(self.zoom > 0)
         latitude = unproject(self.center).lat
         resolution = 2 * math.pi * EARTH_RADIUS_M * math.cos(math.radians(latitude)) / self.world_size
         self.scale_bar.set_resolution(resolution)
@@ -152,6 +162,10 @@ class RouteMap(QWidget):
         return self.center * self.world_size - self.midpoint
 
     def move_view(self, center, zoom):
+        self._fitted_view = None
+        self._set_view(center, zoom)
+
+    def _set_view(self, center, zoom):
         self.center = QPointF(center.x() % 1, max(0, min(1, center.y())))
         self.zoom = zoom
         self._refresh_controls()
@@ -159,58 +173,51 @@ class RouteMap(QWidget):
         self.update()
 
     def zoom_by(self, steps, anchor=None):
-        zoom = max(2, min(19, self.zoom + steps))
+        zoom = max(0, min(MAX_TILE_ZOOM, self.zoom + steps * ZOOM_STEP))
         if zoom == self.zoom:
             return
         offset = (anchor if anchor is not None else self.midpoint) - self.midpoint
         self.move_view(self.center + offset / self.world_size - offset / (TILE_SIZE * 2 ** zoom), zoom)
 
     def fit_route(self):
-        if not self.points:
-            return
-        points = [self.origin + point for point in self._screen_points()]
-        self.fit_projected([point / self.world_size for point in points])
+        if self.points:
+            self.fit_projected(project_route(self.points, self.center.x()), padding=64)
 
-    def fit_projected(self, projected, *, padding=64, minimum_zoom=2):
-        left, right = min(p.x() for p in projected), max(p.x() for p in projected)
-        top, bottom = min(p.y() for p in projected), max(p.y() for p in projected)
-        scale = max((right - left) / max(1, self.width() - padding),
-                    (bottom - top) / max(1, self.height() - padding))
-        zoom = max(minimum_zoom, min(19, math.floor(-math.log2(TILE_SIZE * scale)))) if scale else 16
-        self.move_view(QPointF((left + right) / 2, (top + bottom) / 2), zoom)
+    def fit_projected(self, points, *, padding):
+        self._fitted_view = projected_bounds(points), padding
+        self._refit_view()
+
+    def _refit_view(self):
+        bounds, padding = self._fitted_view
+        zoom = fitted_zoom(bounds, self.width() - padding, self.height() - padding, single_point_zoom=16)
+        self._set_view(bounds.center(), zoom)
 
     def resizeEvent(self, event):
         self.scale_bar.move(12, self.height() - self.scale_bar.height() - 12)
-        self.tile_timer.start()
+        if self._fitted_view is not None:
+            self._refit_view()
+        else:
+            self.tile_timer.start()
         super().resizeEvent(event)
 
     def _visible_tiles(self):
-        return visible_tiles(self.origin, self.width(), self.height(), self.zoom, self.world_size)
+        return visible_tiles(self.origin, self.width(), self.height(), tile_zoom(self.zoom), self.world_size)
 
     def request_tiles(self):
         self.tiles.show_tiles({key for key, _ in self._visible_tiles()})
 
     def _screen_points(self):
-        previous = self.center.x()
-        origin = self.origin
-        result = []
-        for point in self.points:
-            projected = project(point)
-            x = projected.x() + round(previous - projected.x())
-            previous = x
-            result.append(QPointF(x, projected.y()) * self.world_size - origin)
-        return result
+        origin, world_size = self.origin, self.world_size
+        return [point * world_size - origin for point in project_route(self.points, self.center.x())]
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(self.colors["field"]))
+        painter.setPen(QColor(self.colors["border"]))
         for key, rect in self._visible_tiles():
-            tile = self.tiles.images.get(key)
-            if tile is not None:
-                painter.drawPixmap(rect, tile, QRectF(tile.rect()))
-            else:
-                painter.setPen(QColor(self.colors["border"]))
+            if key not in self.tiles.images:
                 painter.drawRect(rect)
+        self.tiles.paint(painter, self.origin, self.width(), self.height(), self.world_size)
         points = self._screen_points()
         if not points:
             return
@@ -297,13 +304,14 @@ class RouteMap(QWidget):
         return True
 
     def _update_route(self):
+        self._fitted_view = None
         self.update()
         self.route_changed.emit()
 
     def wheelEvent(self, event):
-        delta = event.angleDelta().y()
+        delta = event.angleDelta().y() or event.pixelDelta().y()
         if delta:
-            self.zoom_by(1 if delta > 0 else -1, event.position())
+            self.zoom_by(delta / 120, event.position())
         event.accept()
 
     def mousePressEvent(self, event):

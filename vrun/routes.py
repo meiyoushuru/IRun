@@ -14,6 +14,10 @@ from geopy.distance import geodesic
 from .coordinates import bd09_to_wgs84
 
 
+def route_kind(closed):
+    return "闭合环线" if closed else "往返路线"
+
+
 @dataclass(frozen=True)
 class Point:
     lat: float
@@ -51,7 +55,7 @@ class Route:
 
     @property
     def kind(self) -> str:
-        return "闭合环线" if self.closed else "非闭合 · 往返"
+        return route_kind(self.closed)
 
     @property
     def distance_summary(self) -> str:
@@ -173,10 +177,14 @@ def build_route(path: Path, coordinates: Sequence[Point], *, closed: bool) -> Ro
     return Route(path, tuple(points), lengths, closed)
 
 
+def pace_seconds(speed: float) -> int:
+    return math.floor(1000 / speed + 0.5)
+
+
 def pace_text(speed: float) -> str:
     if not math.isfinite(speed) or speed <= 0:
         return "—"
-    seconds = round(1000 / speed)
+    seconds = pace_seconds(speed)
     return f"{seconds // 60}:{seconds % 60:02d} / 公里"
 
 

@@ -6,6 +6,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import re
 from tempfile import NamedTemporaryFile
 from unicodedata import normalize
 from uuid import uuid4
@@ -17,6 +18,7 @@ from .routes import (MAX_ROUTE_BYTES, MAX_ROUTE_POINTS, Point, Route, build_rout
 
 GPX = {"gpx": "http://www.topografix.com/GPX/1/1"}
 MAX_ROUTE_NAME_LENGTH = 120
+INVALID_ROUTE_NAME_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 @dataclass(frozen=True)
@@ -191,6 +193,8 @@ def validate_name(name: str) -> str:
         raise ValueError("请输入路线名称")
     if len(name) > MAX_ROUTE_NAME_LENGTH:
         raise ValueError("路线名称最多支持 120 个字符")
+    if INVALID_ROUTE_NAME_CHARS.search(name):
+        raise ValueError("路线名称包含无法保存的字符，请修改名称后重试")
     return name
 
 
